@@ -14,7 +14,7 @@ A small WordPress helper plugin for [Reviews and Rating – Google Reviews](http
   - A Google Places API connection/key test
   - A rolling sync log (last 500 entries, most recent 50 shown)
 - One-time repair routine that backfills missing keys on legacy review rows after upgrading.
-- Optional error email notifications: enable in **Settings → GBRR Sync** and enter one or more addresses (comma-separated) to get a single summary email whenever a sync run has one or more failed locations.
+- Optional error email notifications: enable in **Settings → GBRR Sync** and enter one or more addresses (comma-separated) to get a single summary email whenever a sync run has one or more failed locations. Leave the address field blank to use the site's admin email.
 
 ## Requirements
 

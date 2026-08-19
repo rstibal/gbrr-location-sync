@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.3.0
+ * Version:     1.3.1
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.3.0' );
+define( 'GBRR_SYNC_VERSION',     '1.3.1' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
@@ -809,6 +809,13 @@ class GBRR_Location_Sync {
 
 		$enabled = ! empty( $_POST['gbrr_notify_enabled'] );
 		$emails  = isset( $_POST['gbrr_notify_email'] ) ? sanitize_text_field( wp_unslash( $_POST['gbrr_notify_email'] ) ) : '';
+
+		// The field's placeholder shows the site admin email as a hint;
+		// make that real instead of just cosmetic — a blank field falls
+		// back to it rather than failing validation.
+		if ( '' === trim( $emails ) ) {
+			$emails = get_option( 'admin_email' );
+		}
 
 		$valid_emails = array_filter( array_map( 'trim', explode( ',', $emails ) ), 'is_email' );
 
