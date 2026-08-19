@@ -1,0 +1,82 @@
+name: Build Release Zip
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The plugin's `Version:` header is the single source of truth for
+      # the release version (never the git tag) -- this also catches a
+      # tag/header mismatch before a bad zip gets attached to a release.
+      - name: Read plugin version
+        id: version
+        run: |
+          version=$(grep -oP '^\s*\*\s*Version:\s*\K[0-9][\w.\-]*' gbrr-location-sync.php)
+          if [ -z "$version" ]; then
+            echo "Could not find a Version: header in gbrr-location-sync.php" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches plugin version
+        if: github.event_name == 'release'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="${{ steps.version.outputs.version }}"
+          if [ "$tag" != "$version" ]; then
+            echo "Release tag '$GITHUB_REF_NAME' does not match plugin Version header '$version'" >&2
+            exit 1
+          fi
+
+      # Copy only the files WordPress needs to install and run the
+      # plugin -- not dev tooling (.github/, .gitattributes, .gitignore).
+      - name: Build distributable copy
+        run: |
+          slug="gbrr-location-sync"
+          mkdir -p "build/$slug"
+          cp gbrr-location-sync.php README.md LICENSE "build/$slug/"
+
+      # Deliberately run on ubuntu-latest, not Windows: Linux's `zip`
+      # always writes forward-slash entry names, so there's no
+      # backslash-in-filenames bug to guard against here at all. See
+      # README.md's "Building a release zip" section for the history.
+      - name: Create zip
+        id: zip
+        run: |
+          slug="gbrr-location-sync"
+          version="${{ steps.version.outputs.version }}"
+          zip_name="$slug-$version.zip"
+          (cd build && zip -r "../$zip_name" "$slug")
+          echo "zip_name=$zip_name" >> "$GITHUB_OUTPUT"
+
+      - name: Verify zip has no backslash paths
+        run: |
+          zip_name="${{ steps.zip.outputs.zip_name }}"
+          if unzip -l "$zip_name" | awk '{print $4}' | grep -q '\\'; then
+            echo "Zip contains backslash path separators:" >&2
+            unzip -l "$zip_name" | awk '{print $4}' | grep '\\' >&2
+            exit 1
+          fi
+          echo "OK: no backslash paths in $zip_name"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.zip.outputs.zip_name }}
+          path: ${{ steps.zip.outputs.zip_name }}
+
+      - name: Attach zip to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "${{ steps.zip.outputs.zip_name }}" --clobber

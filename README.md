@@ -28,22 +28,32 @@ A small WordPress helper plugin for [Reviews and Rating – Google Reviews](http
 2. Activate **GBRR Location Sync** from the WordPress Plugins screen.
 3. Visit **Settings → GBRR Sync** to check status or trigger a manual sync.
 
-## Building a release zip
+## Cutting a release
 
-Run `.\build-release.ps1` from the repo root. It uses `git archive` (never
-`Compress-Archive`) to build `dist/gbrr-location-sync-<version>.zip`, with
-every file under a top-level `gbrr-location-sync/` folder as WordPress'
-installer requires.
+Release zips are built by GitHub Actions (`.github/workflows/release.yml`),
+never on a local Windows machine. Bump the `Version:` header, commit and
+push, then publish a GitHub release (e.g. `gh release create vX.Y.Z`) —
+that triggers the workflow, which reads the version straight from the
+plugin header, copies just the distributable files into a
+`gbrr-location-sync/` folder, and zips them with Linux's `zip` on an
+`ubuntu-latest` runner, then attaches the result to the release.
 
-`Compress-Archive` — and naive zipping on Windows generally — embeds
-literal backslashes in zip entry names instead of the forward slashes the
-zip format requires. The archive opens fine locally, but on the Linux
-hosts WordPress normally runs on, files land with backslashes *in* their
-filenames instead of in subfolders, and the plugin fails to install
-correctly. `git archive` always writes forward-slash paths regardless of
-host OS, so it's the only supported way to build a release here. The
-script also verifies every entry in the resulting zip before handing back
-the path, and fails loudly if anything looks wrong.
+The workflow runs on Linux specifically because that's what keeps zip
+entries forward-slash. `Compress-Archive` — and naive zipping on Windows
+generally — embeds literal backslashes in zip entry names instead of the
+forward slashes the zip format requires. It opens fine locally, but on
+the Linux hosts WordPress normally runs on, files land with backslashes
+*in* their filenames instead of in subfolders, and the plugin fails to
+install correctly. Building on `ubuntu-latest` sidesteps the problem
+entirely rather than working around it — there's no Windows zip tool
+involved at any point. The workflow also double-checks every zip entry
+for backslashes and fails the build if it finds any, and fails if the
+release tag doesn't match the plugin's `Version:` header.
+
+You can also trigger the workflow manually (`workflow_dispatch`, or the
+"Run workflow" button in the Actions tab) to sanity-check a build without
+publishing a release — it uploads the zip as a workflow artifact either
+way.
 
 ## Notes
 
