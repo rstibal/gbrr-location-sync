@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.2.2
+ * Version:     1.2.3
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.2.2' );
+define( 'GBRR_SYNC_VERSION',     '1.2.3' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
@@ -201,7 +201,7 @@ class GBRR_Location_Sync {
 		}
 
 		// Persist
-		update_option( GBRR_SYNC_OPTION_BASE . '_places',  $places,      'no' );
+		update_option( GBRR_SYNC_OPTION_BASE . '_places',  $places,      'yes' );
 		update_option( GBRR_SYNC_OPTION_BASE . '_reviews', $reviews_all, 'no' );
 		wp_cache_delete( 'reviews',          GBRR_SYNC_OPTION_BASE );
 		wp_cache_delete( 'reviews_shuffled', GBRR_SYNC_OPTION_BASE );
@@ -218,7 +218,7 @@ class GBRR_Location_Sync {
 	}
 
 	// -----------------------------------------------------------------------
-	// One-time repair of legacy review rows (v1.2.2)
+	// One-time repair of legacy review rows (bumped on schema-affecting changes)
 	// -----------------------------------------------------------------------
 
 	public function maybe_repair_reviews() {
@@ -335,36 +335,63 @@ class GBRR_Location_Sync {
 	// -----------------------------------------------------------------------
 
 	private function merge_reviews( $existing, $new_reviews, $place_id ) {
+		// Native rows start their `id` counter at max(existing ids) + 1
+		// (see g-business-reviews-rating's set_reviews()); mirror that
+		// here so IDs we assign don't collide with what the parent
+		// plugin assigns on its own hourly sync.
+		$max_id = 0;
+		foreach ( $existing as $row ) {
+			if ( is_array( $row ) && isset( $row['id'] ) && is_numeric( $row['id'] ) && $row['id'] > $max_id ) {
+				$max_id = $row['id'];
+			}
+		}
+
 		foreach ( $new_reviews as $review ) {
 			if ( ! isset( $review['time'], $review['rating'], $review['author_name'] ) ) {
 				continue;
 			}
-			$key = $review['time'] . '_' . $review['rating'] . '_' . md5( $review['author_name'] );
+			// Must match the parent plugin's own key formula exactly
+			// (time_rating_md5(author+text)) or every review we write
+			// gets treated as unrecognized on the parent's next hourly
+			// sync and re-keyed via its slower author-matching fallback.
+			$key = $review['time'] . '_' . $review['rating'] . '_' . md5( $review['author_name'] . '_' . mb_substr( (string) ( $review['text'] ?? '' ), 0, 100 ) );
 			$row = ( isset( $existing[ $key ] ) && is_array( $existing[ $key ] ) ) ? $existing[ $key ] : array();
 
-			$existing[ $key ] = $this->normalize_review_row( $row, $review, $place_id );
+			$next_id = null;
+			if ( empty( $row ) ) {
+				$max_id++;
+				$next_id = $max_id;
+			}
+
+			$existing[ $key ] = $this->normalize_review_row( $row, $review, $place_id, $next_id );
 		}
 		return $existing;
 	}
 
 	/**
-	 * Returns a review row containing every key the parent plugin
-	 * (g-business-reviews-rating) writes on its own native rows.
+	 * Returns a review row shaped like the parent plugin's own native
+	 * rows (g-business-reviews-rating's set_reviews()).
 	 *
 	 * Rows missing keys — especially `checked` — fail the parent's
 	 * "recently checked" guard and are re-processed (remote avatar
 	 * fetch included) on every run, which is what caused the
 	 * wp-admin 502s. Keys the parent manages itself (`id`, `order`,
 	 * `checked`, `avatar`) are preserved when present, never invented.
+	 *
+	 * $next_id is only used when $row is empty (a genuinely new
+	 * review) — it must be pre-computed by the caller as
+	 * max(existing ids) + 1, matching the parent's own id assignment.
 	 */
-	private function normalize_review_row( $row, $review, $place_id ) {
+	private function normalize_review_row( $row, $review, $place_id, $next_id = null ) {
+		$is_new = empty( $row );
+
 		$normalized = array(
-			'id'                        => $row['id'] ?? null,
+			'id'                        => $row['id'] ?? $next_id,
 			'place_id'                  => $place_id,
 			'order'                     => $row['order'] ?? 0,
 			'checked'                   => $row['checked'] ?? null,
 			'retrieved'                 => time(),
-			'imported'                  => $row['imported'] ?? null,
+			'imported'                  => $row['imported'] ?? ( $is_new ? false : null ),
 			'time_estimate'             => $row['time_estimate'] ?? false,
 			'removable'                 => $row['removable'] ?? false,
 			'status'                    => $row['status'] ?? true,
@@ -372,7 +399,6 @@ class GBRR_Location_Sync {
 			'author_name'               => $review['author_name'] ?? ( $row['author_name'] ?? '' ),
 			'author_url'                => $review['author_url'] ?? ( $row['author_url'] ?? '' ),
 			'language'                  => $review['language'] ?? ( $row['language'] ?? '' ),
-			'original_language'         => $review['original_language'] ?? ( $review['language'] ?? ( $row['original_language'] ?? '' ) ),
 			'rating'                    => $review['rating'] ?? ( $row['rating'] ?? null ),
 			'relative_time_description' => $review['relative_time_description'] ?? ( $row['relative_time_description'] ?? '' ),
 			'text'                      => $review['text'] ?? ( $row['text'] ?? '' ),
