@@ -23,9 +23,26 @@ A small WordPress helper plugin for [Reviews and Rating – Google Reviews](http
 
 ## Installation
 
-1. Copy `gbrr-location-sync.php` into `wp-content/plugins/gbrr-location-sync/`.
+1. Copy `gbrr-location-sync.php` into `wp-content/plugins/gbrr-location-sync/`, or upload the release zip (see below) via **Plugins → Add New → Upload Plugin**.
 2. Activate **GBRR Location Sync** from the WordPress Plugins screen.
 3. Visit **Settings → GBRR Sync** to check status or trigger a manual sync.
+
+## Building a release zip
+
+Run `.\build-release.ps1` from the repo root. It uses `git archive` (never
+`Compress-Archive`) to build `dist/gbrr-location-sync-<version>.zip`, with
+every file under a top-level `gbrr-location-sync/` folder as WordPress'
+installer requires.
+
+`Compress-Archive` — and naive zipping on Windows generally — embeds
+literal backslashes in zip entry names instead of the forward slashes the
+zip format requires. The archive opens fine locally, but on the Linux
+hosts WordPress normally runs on, files land with backslashes *in* their
+filenames instead of in subfolders, and the plugin fails to install
+correctly. `git archive` always writes forward-slash paths regardless of
+host OS, so it's the only supported way to build a release here. The
+script also verifies every entry in the resulting zip before handing back
+the path, and fails loudly if anything looks wrong.
 
 ## Notes
 

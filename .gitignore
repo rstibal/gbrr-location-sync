@@ -2,6 +2,7 @@
 Thumbs.db
 *.log
 *.zip
+/dist/
 /node_modules/
 /.vscode/
 /.idea/
