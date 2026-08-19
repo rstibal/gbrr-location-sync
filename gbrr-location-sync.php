@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.2.3
+ * Version:     1.3.0
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,11 +15,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.2.3' );
+define( 'GBRR_SYNC_VERSION',     '1.3.0' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
 define( 'GBRR_SYNC_DB_OPTION',   'gbrr_sync_db_version' );
+define( 'GBRR_SYNC_NOTIFY_ENABLED_OPTION', 'gbrr_location_sync_notify_enabled' );
+define( 'GBRR_SYNC_NOTIFY_EMAIL_OPTION',   'gbrr_location_sync_notify_email' );
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -55,6 +57,7 @@ class GBRR_Location_Sync {
 		add_action( 'admin_notices',               array( $this, 'dependency_notice' ) );
 		add_action( 'admin_post_gbrr_sync_now',    array( $this, 'handle_manual_sync' ) );
 		add_action( 'admin_post_gbrr_conn_test',   array( $this, 'handle_conn_test' ) );
+		add_action( 'admin_post_gbrr_save_notify', array( $this, 'handle_save_notify' ) );
 		add_action( 'admin_init',                  array( $this, 'maybe_repair_reviews' ) );
 	}
 
@@ -214,7 +217,79 @@ class GBRR_Location_Sync {
 			count( $results )
 		) );
 
+		$this->maybe_notify_errors( $results, $places );
+
 		return $results;
+	}
+
+	// -----------------------------------------------------------------------
+	// Error email notifications
+	// -----------------------------------------------------------------------
+
+	/**
+	 * Emails the configured address(es) a summary of this run's failed
+	 * locations, if notifications are enabled and at least one failed.
+	 * One email per run — not per error — to avoid spamming on repeated
+	 * failures of the same location.
+	 */
+	private function maybe_notify_errors( $results, $places ) {
+		if ( ! get_option( GBRR_SYNC_NOTIFY_ENABLED_OPTION, false ) ) {
+			return;
+		}
+
+		$failures = array_filter( $results, function( $r ) { return ! $r['ok']; } );
+		if ( empty( $failures ) ) {
+			return;
+		}
+
+		$to = $this->get_notify_emails();
+		if ( empty( $to ) ) {
+			return;
+		}
+
+		$names_by_pid = array();
+		foreach ( $places as $place ) {
+			if ( isset( $place['place_id'] ) ) {
+				$names_by_pid[ $place['place_id'] ] = $place['name'] ?? $place['vicinity'] ?? $place['place_id'];
+			}
+		}
+
+		$lines = array();
+		foreach ( $failures as $pid => $failure ) {
+			$lines[] = sprintf(
+				'- %s (%s): %s',
+				$names_by_pid[ $pid ] ?? $pid,
+				$pid,
+				$failure['error'] ?? 'Unknown error'
+			);
+		}
+
+		$site_name = get_bloginfo( 'name' );
+		$subject   = sprintf( '[%s] GBRR Location Sync: %d location(s) failed to sync', $site_name, count( $failures ) );
+		$body      = sprintf(
+			"GBRR Location Sync ran on %s and %d of %d location(s) failed:\n\n%s\n\nSee Settings \xE2\x86\x92 GBRR Sync on %s for the full log.",
+			gmdate( 'Y-m-d H:i:s' ) . ' UTC',
+			count( $failures ),
+			count( $results ),
+			implode( "\n", $lines ),
+			home_url()
+		);
+
+		wp_mail( $to, $subject, $body );
+	}
+
+	/**
+	 * Returns the configured notification email address(es) as an array,
+	 * or an empty array if none are set.
+	 */
+	private function get_notify_emails() {
+		$raw = get_option( GBRR_SYNC_NOTIFY_EMAIL_OPTION, '' );
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return array();
+		}
+
+		$emails = array_filter( array_map( 'trim', explode( ',', $raw ) ), 'is_email' );
+		return array_values( $emails );
 	}
 
 	// -----------------------------------------------------------------------
@@ -556,6 +631,27 @@ class GBRR_Location_Sync {
 			</div>
 			<?php endif; ?>
 
+			<!-- Error email notifications -->
+			<h2 style="margin-top:24px;">Error Email Notifications</h2>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="background:#fff;border:1px solid #c3c4c7;border-radius:4px;padding:16px 20px;margin-bottom:28px;max-width:640px;">
+				<?php wp_nonce_field( 'gbrr_save_notify', 'gbrr_notify_nonce' ); ?>
+				<input type="hidden" name="action" value="gbrr_save_notify">
+				<p>
+					<label>
+						<input type="checkbox" name="gbrr_notify_enabled" value="1" <?php checked( get_option( GBRR_SYNC_NOTIFY_ENABLED_OPTION, false ) ); ?>>
+						Email me when a sync run has one or more errors
+					</label>
+				</p>
+				<p>
+					<label for="gbrr_notify_email" style="display:block;font-weight:600;margin-bottom:4px;">Notify email address(es)</label>
+					<input type="text" id="gbrr_notify_email" name="gbrr_notify_email" class="regular-text" placeholder="<?php echo esc_attr( get_option( 'admin_email' ) ); ?>" value="<?php echo esc_attr( get_option( GBRR_SYNC_NOTIFY_EMAIL_OPTION, '' ) ); ?>">
+					<br><span style="color:#666;font-size:12px;">Comma-separate multiple addresses. One email is sent per sync run (not per error) summarizing every location that failed.</span>
+				</p>
+				<p>
+					<button class="button button-primary" type="submit">Save Notification Settings</button>
+				</p>
+			</form>
+
 			<!-- Locations table -->
 			<h2 style="margin-top:24px;">Saved Locations</h2>
 			<?php if ( empty( $places ) ) : ?>
@@ -700,6 +796,29 @@ class GBRR_Location_Sync {
 		) );
 
 		set_transient( 'gbrr_conn_result', $result, 60 );
+
+		wp_safe_redirect( admin_url( 'options-general.php?page=gbrr-location-sync' ) );
+		exit;
+	}
+
+	public function handle_save_notify() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Access denied.' );
+		}
+		check_admin_referer( 'gbrr_save_notify', 'gbrr_notify_nonce' );
+
+		$enabled = ! empty( $_POST['gbrr_notify_enabled'] );
+		$emails  = isset( $_POST['gbrr_notify_email'] ) ? sanitize_text_field( wp_unslash( $_POST['gbrr_notify_email'] ) ) : '';
+
+		$valid_emails = array_filter( array_map( 'trim', explode( ',', $emails ) ), 'is_email' );
+
+		if ( $enabled && empty( $valid_emails ) ) {
+			set_transient( 'gbrr_sync_flash', 'Error notifications were not enabled: please enter at least one valid email address.', 60 );
+		} else {
+			update_option( GBRR_SYNC_NOTIFY_ENABLED_OPTION, $enabled, 'yes' );
+			update_option( GBRR_SYNC_NOTIFY_EMAIL_OPTION, implode( ', ', $valid_emails ), 'yes' );
+			set_transient( 'gbrr_sync_flash', 'Notification settings saved.', 60 );
+		}
 
 		wp_safe_redirect( admin_url( 'options-general.php?page=gbrr-location-sync' ) );
 		exit;
