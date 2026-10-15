@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.3.1
+ * Version:     1.3.2
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.3.1' );
+define( 'GBRR_SYNC_VERSION',     '1.3.2' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
@@ -84,14 +84,29 @@ class GBRR_Location_Sync {
 	// Core sync logic
 	// -----------------------------------------------------------------------
 
+	/**
+	 * Returns the per-location results keyed by place ID, or false when
+	 * the run was skipped (no API key or no saved locations).
+	 */
 	public function run_sync() {
-		$api_key   = get_option( GBRR_SYNC_OPTION_BASE . '_api_key' );
-		$places    = get_option( GBRR_SYNC_OPTION_BASE . '_places', array() );
-		$active_id = get_option( GBRR_SYNC_OPTION_BASE . '_place_id' );
+		$api_key = get_option( GBRR_SYNC_OPTION_BASE . '_api_key' );
+		$places  = get_option( GBRR_SYNC_OPTION_BASE . '_places', array() );
 
-		if ( empty( $api_key ) || ! is_array( $places ) || empty( $places ) ) {
-			$this->log( 'skip', 'No API key or no saved locations; aborting sync.' );
-			return array();
+		if ( empty( $api_key ) ) {
+			$this->log( 'skip', 'No API key configured in the parent plugin; aborting sync.' );
+			$this->notify_skipped( 'No Google Places API key is configured in the Reviews and Rating plugin, so no locations could be synced.' );
+			return false;
+		}
+
+		if ( ! is_array( $places ) || empty( $places ) ) {
+			$this->log( 'skip', 'No saved locations; aborting sync.' );
+			return false;
+		}
+
+		// Each location can take up to the 15s request timeout; don't let
+		// PHP's default 30s limit kill a multi-location run part-way.
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 60 + 20 * count( $places ) ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
 		}
 
 		$fields = get_option( GBRR_SYNC_OPTION_BASE . '_retrieval_fields', null );
@@ -117,14 +132,9 @@ class GBRR_Location_Sync {
 			|| ( is_numeric( $translate_raw ) && intval( $translate_raw ) >= 1 )
 		);
 
-		$reviews_all = get_option( GBRR_SYNC_OPTION_BASE . '_reviews', array() );
-		if ( ! is_array( $reviews_all ) ) {
-			$reviews_all = array();
-		}
-
 		$results = array();
 
-		foreach ( $places as $idx => $place ) {
+		foreach ( $places as $place ) {
 			$pid = isset( $place['place_id'] ) ? $place['place_id'] : null;
 			if ( ! $pid ) {
 				continue;
@@ -134,7 +144,7 @@ class GBRR_Location_Sync {
 
 			if ( is_wp_error( $response ) ) {
 				$safe_error = $this->redact_key( $response->get_error_message() );
-				$places[ $idx ]['status'] = false;
+				$this->persist_place( $pid, array( 'status' => false ) );
 				$results[ $pid ] = array( 'ok' => false, 'error' => $safe_error );
 				$this->log( 'error', sprintf( 'WP_Error for %s (%s): %s', $pid, $place['vicinity'] ?? '', $safe_error ) );
 				continue;
@@ -143,43 +153,45 @@ class GBRR_Location_Sync {
 			$data = json_decode( wp_remote_retrieve_body( $response ), true );
 
 			if ( ! is_array( $data ) || empty( $data ) || ! isset( $data['status'] ) ) {
-				$places[ $idx ]['status'] = false;
+				$this->persist_place( $pid, array( 'status' => false ) );
 				$results[ $pid ] = array( 'ok' => false, 'error' => 'Empty or malformed API response' );
 				$this->log( 'error', sprintf( 'Malformed response for %s (%s)', $pid, $place['vicinity'] ?? '' ) );
 				continue;
 			}
 
 			if ( 'OK' !== $data['status'] ) {
-				$places[ $idx ]['status'] = false;
+				$this->persist_place( $pid, array( 'status' => false ) );
 				$error_msg = isset( $data['error_message'] ) ? $data['error_message'] : $data['status'];
 				$results[ $pid ] = array( 'ok' => false, 'error' => $error_msg );
 				$this->log( 'error', sprintf( 'API status "%s" for %s (%s): %s', $data['status'], $pid, $place['vicinity'] ?? '', $error_msg ) );
 				continue;
 			}
 
-			// Merge new reviews into the master reviews store
-			if ( isset( $data['result']['reviews'] ) && is_array( $data['result']['reviews'] ) ) {
-				$reviews_all = $this->merge_reviews( $reviews_all, $data['result']['reviews'], $pid );
+			// Build the place snapshot update. Fields fall back to the
+			// stored value when absent, except rating / rating_count:
+			// when they were requested, absence means "no ratings yet".
+			$r      = $data['result'];
+			$update = array(
+				'time'   => time(),
+				'status' => isset( $r['name'] ),
+			);
+			foreach ( array( 'name', 'formatted_address', 'vicinity', 'icon' ) as $key ) {
+				if ( isset( $r[ $key ] ) ) {
+					$update[ $key ] = $r[ $key ];
+				}
+			}
+			if ( in_array( 'rating', $fields, true ) ) {
+				$update['rating'] = $r['rating'] ?? null;
+			}
+			if ( in_array( 'user_ratings_total', $fields, true ) ) {
+				$update['rating_count'] = $r['user_ratings_total'] ?? null;
 			}
 
-			// Update the place snapshot
-			$r = $data['result'];
-			$places[ $idx ]['time']              = time();
-			$places[ $idx ]['status']            = isset( $r['name'] ) && $r['name'] !== null;
-			$places[ $idx ]['name']              = $r['name']               ?? ( $places[ $idx ]['name']              ?? null );
-			$places[ $idx ]['rating']            = $r['rating']             ?? null;
-			$places[ $idx ]['rating_count']      = $r['user_ratings_total'] ?? null;
-			$places[ $idx ]['formatted_address'] = $r['formatted_address']  ?? ( $places[ $idx ]['formatted_address'] ?? null );
-			$places[ $idx ]['vicinity']          = $r['vicinity']           ?? ( $places[ $idx ]['vicinity']          ?? null );
-			$places[ $idx ]['icon']              = $r['icon']               ?? ( $places[ $idx ]['icon']              ?? null );
+			$new_reviews = ( isset( $r['reviews'] ) && is_array( $r['reviews'] ) ) ? $r['reviews'] : array();
 
-			// Refresh _result for the active/default location
-			if ( $pid === $active_id ) {
-				update_option( GBRR_SYNC_OPTION_BASE . '_result',       $data, 'no' );
-				update_option( GBRR_SYNC_OPTION_BASE . '_result_valid', $data, 'no' );
-				wp_cache_delete( 'result',       GBRR_SYNC_OPTION_BASE );
-				wp_cache_delete( 'result_valid', GBRR_SYNC_OPTION_BASE );
-			}
+			// Saved per location (not once at the end) so a run cut short
+			// still keeps the locations it finished.
+			$this->persist_place( $pid, $update, $new_reviews, $data );
 
 			$results[ $pid ] = array(
 				'ok'           => true,
@@ -198,17 +210,18 @@ class GBRR_Location_Sync {
 			) );
 		}
 
-		// Fix the default flag: exactly one entry should be true, matching active_id
-		foreach ( $places as $idx => $place ) {
-			$places[ $idx ]['default'] = ( ( $place['place_id'] ?? null ) === $active_id );
+		// Fix the default flag: exactly one entry should be true, matching
+		// the active location as it stands now (it may have changed mid-run).
+		$active_id = $this->fresh_option( GBRR_SYNC_OPTION_BASE . '_place_id' );
+		$places    = $this->fresh_option( GBRR_SYNC_OPTION_BASE . '_places', array() );
+		if ( is_array( $places ) ) {
+			foreach ( $places as $idx => $place ) {
+				if ( is_array( $place ) ) {
+					$places[ $idx ]['default'] = ( ( $place['place_id'] ?? null ) === $active_id );
+				}
+			}
+			update_option( GBRR_SYNC_OPTION_BASE . '_places', $places, 'yes' );
 		}
-
-		// Persist
-		update_option( GBRR_SYNC_OPTION_BASE . '_places',  $places,      'yes' );
-		update_option( GBRR_SYNC_OPTION_BASE . '_reviews', $reviews_all, 'no' );
-		wp_cache_delete( 'reviews',          GBRR_SYNC_OPTION_BASE );
-		wp_cache_delete( 'reviews_shuffled', GBRR_SYNC_OPTION_BASE );
-		delete_transient( GBRR_SYNC_OPTION_BASE . '_reviews_shuffled' );
 
 		$ok_count = count( array_filter( $results, function( $r ) { return $r['ok']; } ) );
 		$this->log( 'complete', sprintf(
@@ -217,9 +230,67 @@ class GBRR_Location_Sync {
 			count( $results )
 		) );
 
-		$this->maybe_notify_errors( $results, $places );
+		$this->maybe_notify_errors( $results, is_array( $places ) ? $places : array() );
 
 		return $results;
+	}
+
+	/**
+	 * Saves one location's sync outcome.
+	 *
+	 * The parent plugin's own hourly sync (or an admin editing locations)
+	 * can write `_places` / `_reviews` while our HTTP requests are in
+	 * flight, so each save re-reads the current options and merges only
+	 * this location's changes into them, rather than writing back a copy
+	 * read at the start of the run. A location removed mid-run stays
+	 * removed.
+	 */
+	private function persist_place( $pid, $update, $new_reviews = array(), $data = null ) {
+		$places = $this->fresh_option( GBRR_SYNC_OPTION_BASE . '_places', array() );
+		$found  = false;
+		if ( is_array( $places ) ) {
+			foreach ( $places as $idx => $place ) {
+				if ( is_array( $place ) && ( $place['place_id'] ?? null ) === $pid ) {
+					$places[ $idx ] = array_merge( $place, $update );
+					$found          = true;
+				}
+			}
+		}
+		if ( ! $found ) {
+			return; // Location was removed mid-run; don't write anything for it.
+		}
+		update_option( GBRR_SYNC_OPTION_BASE . '_places', $places, 'yes' );
+
+		if ( ! empty( $new_reviews ) ) {
+			$reviews_all = $this->fresh_option( GBRR_SYNC_OPTION_BASE . '_reviews', array() );
+			if ( ! is_array( $reviews_all ) ) {
+				$reviews_all = array();
+			}
+			$reviews_all = $this->merge_reviews( $reviews_all, $new_reviews, $pid );
+			update_option( GBRR_SYNC_OPTION_BASE . '_reviews', $reviews_all, 'no' );
+			wp_cache_delete( 'reviews',          GBRR_SYNC_OPTION_BASE );
+			wp_cache_delete( 'reviews_shuffled', GBRR_SYNC_OPTION_BASE );
+			delete_transient( GBRR_SYNC_OPTION_BASE . '_reviews_shuffled' );
+		}
+
+		// Refresh _result for the active/default location
+		if ( null !== $data && $pid === $this->fresh_option( GBRR_SYNC_OPTION_BASE . '_place_id' ) ) {
+			update_option( GBRR_SYNC_OPTION_BASE . '_result',       $data, 'no' );
+			update_option( GBRR_SYNC_OPTION_BASE . '_result_valid', $data, 'no' );
+			wp_cache_delete( 'result',       GBRR_SYNC_OPTION_BASE );
+			wp_cache_delete( 'result_valid', GBRR_SYNC_OPTION_BASE );
+		}
+	}
+
+	/**
+	 * get_option() that bypasses this request's option cache, so writes
+	 * made by other requests since this one started are seen.
+	 */
+	private function fresh_option( $name, $default = false ) {
+		wp_cache_delete( $name, 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		return get_option( $name, $default );
 	}
 
 	// -----------------------------------------------------------------------
@@ -233,16 +304,12 @@ class GBRR_Location_Sync {
 	 * failures of the same location.
 	 */
 	private function maybe_notify_errors( $results, $places ) {
-		if ( ! get_option( GBRR_SYNC_NOTIFY_ENABLED_OPTION, false ) ) {
-			return;
-		}
-
 		$failures = array_filter( $results, function( $r ) { return ! $r['ok']; } );
 		if ( empty( $failures ) ) {
 			return;
 		}
 
-		$to = $this->get_notify_emails();
+		$to = $this->get_notify_recipients();
 		if ( empty( $to ) ) {
 			return;
 		}
@@ -276,6 +343,40 @@ class GBRR_Location_Sync {
 		);
 
 		wp_mail( $to, $subject, $body );
+	}
+
+	/**
+	 * Emails the configured address(es) when a run could not sync any
+	 * location at all (e.g. the API key is missing), if notifications
+	 * are enabled.
+	 */
+	private function notify_skipped( $reason ) {
+		$to = $this->get_notify_recipients();
+		if ( empty( $to ) ) {
+			return;
+		}
+
+		$site_name = get_bloginfo( 'name' );
+		$subject   = sprintf( '[%s] GBRR Location Sync: sync skipped', $site_name );
+		$body      = sprintf(
+			"GBRR Location Sync ran on %s but did not sync any locations:\n\n%s\n\nSee Settings \xE2\x86\x92 GBRR Sync on %s for the full log.",
+			gmdate( 'Y-m-d H:i:s' ) . ' UTC',
+			$reason,
+			home_url()
+		);
+
+		wp_mail( $to, $subject, $body );
+	}
+
+	/**
+	 * Returns the notification recipients, or an empty array if
+	 * notifications are disabled or no valid address is configured.
+	 */
+	private function get_notify_recipients() {
+		if ( ! get_option( GBRR_SYNC_NOTIFY_ENABLED_OPTION, false ) ) {
+			return array();
+		}
+		return $this->get_notify_emails();
 	}
 
 	/**
@@ -545,6 +646,13 @@ class GBRR_Location_Sync {
 		$next_run  = wp_next_scheduled( GBRR_SYNC_CRON_HOOK );
 		$active_id = get_option( GBRR_SYNC_OPTION_BASE . '_place_id' );
 
+		if ( ! is_array( $places ) ) {
+			$places = array();
+		}
+		if ( ! is_array( $log ) ) {
+			$log = array();
+		}
+
 		$flash      = get_transient( 'gbrr_sync_flash' );
 		$conn_result = get_transient( 'gbrr_conn_result' );
 		delete_transient( 'gbrr_sync_flash' );
@@ -553,15 +661,12 @@ class GBRR_Location_Sync {
 		<div class="wrap">
 			<h1>GBRR Location Sync</h1>
 
-			<?php if ( $flash ) : ?>
-				<div class="notice notice-success is-dismissible"><p><?php echo esc_html( $flash ); ?></p></div>
-			<?php endif; ?>
-
-			<?php if ( ! $this->parent_plugin_active() ) : ?>
-				<div class="notice notice-error"><p>
-					<strong>Dependency missing:</strong>
-					The "Reviews and Rating – Google Reviews" plugin is not active.
-				</p></div>
+			<?php if ( $flash ) :
+				// Pre-1.3.2 flashes were plain strings.
+				$flash_msg  = is_array( $flash ) ? ( $flash['message'] ?? '' ) : $flash;
+				$flash_type = is_array( $flash ) && in_array( $flash['type'] ?? '', array( 'success', 'warning', 'error' ), true ) ? $flash['type'] : 'success';
+			?>
+				<div class="notice notice-<?php echo esc_attr( $flash_type ); ?> is-dismissible"><p><?php echo esc_html( $flash_msg ); ?></p></div>
 			<?php endif; ?>
 
 			<!-- Status / action bar -->
@@ -570,7 +675,11 @@ class GBRR_Location_Sync {
 					<strong>Next scheduled sync</strong><br>
 					<?php if ( $next_run ) : ?>
 						<?php echo esc_html( gmdate( 'Y-m-d H:i:s', $next_run ) . ' UTC' ); ?>
-						<span style="color:#666;margin-left:8px;">(<?php echo esc_html( human_time_diff( $next_run ) ); ?> from now)</span>
+						<?php if ( $next_run > time() ) : ?>
+							<span style="color:#666;margin-left:8px;">(<?php echo esc_html( human_time_diff( $next_run ) ); ?> from now)</span>
+						<?php else : ?>
+							<span style="color:#996600;margin-left:8px;">(overdue by <?php echo esc_html( human_time_diff( $next_run ) ); ?> &mdash; WP-Cron runs it on the next site visit)</span>
+						<?php endif; ?>
 					<?php else : ?>
 						<span style="color:#d63638">Not scheduled &mdash; try deactivating and reactivating the plugin.</span>
 					<?php endif; ?>
@@ -764,16 +873,20 @@ class GBRR_Location_Sync {
 		$this->log( 'manual', 'Manual sync triggered by admin user ' . get_current_user_id() );
 		$results = $this->run_sync();
 
-		$ok   = count( array_filter( $results, function( $r ) { return $r['ok']; } ) );
-		$fail = count( $results ) - $ok;
+		if ( false === $results ) {
+			$this->set_flash( 'Sync skipped: no API key or no saved locations are configured in the Reviews and Rating plugin (see log below).', 'warning' );
+		} else {
+			$ok   = count( array_filter( $results, function( $r ) { return $r['ok']; } ) );
+			$fail = count( $results ) - $ok;
 
-		$msg = sprintf(
-			'Sync complete: %d location%s refreshed%s.',
-			$ok,
-			$ok === 1 ? '' : 's',
-			$fail > 0 ? ", {$fail} failed (see log below)" : ''
-		);
-		set_transient( 'gbrr_sync_flash', $msg, 60 );
+			$msg = sprintf(
+				'Sync complete: %d location%s refreshed%s.',
+				$ok,
+				$ok === 1 ? '' : 's',
+				$fail > 0 ? ", {$fail} failed (see log below)" : ''
+			);
+			$this->set_flash( $msg, $fail > 0 ? 'warning' : 'success' );
+		}
 
 		wp_safe_redirect( admin_url( 'options-general.php?page=gbrr-location-sync' ) );
 		exit;
@@ -812,19 +925,24 @@ class GBRR_Location_Sync {
 
 		// The field's placeholder shows the site admin email as a hint;
 		// make that real instead of just cosmetic — a blank field falls
-		// back to it rather than failing validation.
-		if ( '' === trim( $emails ) ) {
+		// back to it when enabling. Disabling with a blank field leaves
+		// it blank rather than filling in the admin email.
+		if ( '' === trim( $emails ) && $enabled ) {
 			$emails = get_option( 'admin_email' );
 		}
 
-		$valid_emails = array_filter( array_map( 'trim', explode( ',', $emails ) ), 'is_email' );
+		$entries        = array_values( array_filter( array_map( 'trim', explode( ',', $emails ) ), 'strlen' ) );
+		$valid_emails   = array_values( array_filter( $entries, 'is_email' ) );
+		$invalid_emails = array_values( array_diff( $entries, $valid_emails ) );
 
-		if ( $enabled && empty( $valid_emails ) ) {
-			set_transient( 'gbrr_sync_flash', 'Error notifications were not enabled: please enter at least one valid email address.', 60 );
+		if ( ! empty( $invalid_emails ) ) {
+			$this->set_flash( 'Notification settings were not saved — not a valid email address: ' . implode( ', ', $invalid_emails ), 'error' );
+		} elseif ( $enabled && empty( $valid_emails ) ) {
+			$this->set_flash( 'Error notifications were not enabled: please enter at least one valid email address.', 'error' );
 		} else {
 			update_option( GBRR_SYNC_NOTIFY_ENABLED_OPTION, $enabled, 'yes' );
 			update_option( GBRR_SYNC_NOTIFY_EMAIL_OPTION, implode( ', ', $valid_emails ), 'yes' );
-			set_transient( 'gbrr_sync_flash', 'Notification settings saved.', 60 );
+			$this->set_flash( 'Notification settings saved.' );
 		}
 
 		wp_safe_redirect( admin_url( 'options-general.php?page=gbrr-location-sync' ) );
@@ -834,6 +952,14 @@ class GBRR_Location_Sync {
 	// -----------------------------------------------------------------------
 	// Helpers
 	// -----------------------------------------------------------------------
+
+	/**
+	 * Queues a one-shot admin notice for the settings page.
+	 * $type is a WP notice class suffix: success, warning or error.
+	 */
+	private function set_flash( $message, $type = 'success' ) {
+		set_transient( 'gbrr_sync_flash', array( 'message' => $message, 'type' => $type ), 60 );
+	}
 
 	private function redact_key( $message ) {
 		if ( ! is_string( $message ) ) {
