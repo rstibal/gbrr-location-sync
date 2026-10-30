@@ -42,6 +42,13 @@ note the `admin_post` handlers end in `exit`, so check their results in a shutdo
 
 ## Releases
 
+Versions follow semantic versioning (`MAJOR.MINOR.PATCH`), no prerelease tags. Patch:
+bug fixes only, no new settings or features. Minor: new features or settings that don't
+break existing setups. Major: breaking changes (dropping support for an older parent-plugin
+version, irreversible changes to stored data, removing a setting). Any change to the shipped
+files (`gbrr-location-sync.php`, `README.md`, `LICENSE`) bumps the version; a change to
+anything else, like this file, doesn't.
+
 Bump the `Version:` header and `GBRR_SYNC_VERSION`, commit, push, then publish a GitHub
 release tagged `vX.Y.Z`. `.github/workflows/release.yml` builds the zip on `ubuntu-latest`,
 fails if the tag doesn't match the header or any zip entry contains a backslash, and
