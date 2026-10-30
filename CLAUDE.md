@@ -48,8 +48,16 @@ fails if the tag doesn't match the header or any zip entry contains a backslash,
 attaches the zip to the release. The zip contains only `gbrr-location-sync.php`,
 `README.md` and `LICENSE`.
 
-**Never build a release zip on Windows** (`Compress-Archive` etc.): it writes backslashes into
-entry names, and the plugin then installs broken on Linux hosts. This has broken a real
-release before.
+**Never build a zip on Windows with `Compress-Archive`** (or similar): it writes backslashes
+into entry names, and the plugin then installs broken on Linux hosts. This has broken a real
+release before. `git archive --format=zip` is safe: it always writes forward slashes.
+
+**A local copy of the zip follows every commit**, for testing before a push. A git
+`post-commit` hook (`.git/hooks/post-commit`) builds `gbrr-location-sync-X.Y.Z.zip` in the
+repo root from `HEAD` (`git archive --format=zip --prefix=gbrr-location-sync/` over the same
+three files release.yml copies, version read from the committed `GBRR_SYNC_VERSION`) and
+deletes any older `gbrr-location-sync-*.zip`. `*.zip` is in `.gitignore`. Hooks aren't
+version-controlled, so a fresh clone doesn't have it; recreate it from this description if
+it's missing (same shape as `C:\code\activity-monitor`'s hook). It never fails a commit.
 
 Commits go directly to `master` (solo project).
