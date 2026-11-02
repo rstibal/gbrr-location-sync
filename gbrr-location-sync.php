@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.3.2
+ * Version:     1.4.0
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.3.2' );
+define( 'GBRR_SYNC_VERSION',     '1.4.0' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
@@ -109,8 +109,24 @@ class GBRR_Location_Sync {
 			@set_time_limit( 60 + 20 * count( $places ) ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
 		}
 
-		$fields = get_option( GBRR_SYNC_OPTION_BASE . '_retrieval_fields', null );
-		if ( ! is_array( $fields ) ) {
+		// Parent 6.x can use Places API (New), which takes different field
+		// names; mirror its own fallback to the defaults when the stored
+		// list is missing or still holds legacy names (dashboard/sync.php).
+		$api_version = $this->api_version();
+		$fields      = get_option( GBRR_SYNC_OPTION_BASE . '_retrieval_fields', null );
+		if ( $api_version && ( ! is_array( $fields ) || in_array( 'name', $fields, true ) ) ) {
+			$fields = array(
+				'displayName',
+				'formattedAddress',
+				'googleMapsUri',
+				'iconMaskBaseUri',
+				'id',
+				'shortFormattedAddress',
+				'rating',
+				'reviews',
+				'userRatingCount',
+			);
+		} elseif ( ! is_array( $fields ) ) {
 			$fields = array(
 				'formatted_address',
 				'icon',
@@ -140,7 +156,7 @@ class GBRR_Location_Sync {
 				continue;
 			}
 
-			$response = $this->fetch_place( $pid, $api_key, $fields, $language, $translate );
+			$response = $this->fetch_place( $pid, $api_key, $fields, $language, $translate, $api_version );
 
 			if ( is_wp_error( $response ) ) {
 				$safe_error = $this->redact_key( $response->get_error_message() );
@@ -152,25 +168,34 @@ class GBRR_Location_Sync {
 
 			$data = json_decode( wp_remote_retrieve_body( $response ), true );
 
-			if ( ! is_array( $data ) || empty( $data ) || ! isset( $data['status'] ) ) {
+			// Places API (New) replies have no `status`; errors come back
+			// as { "error": { "status", "message" } }.
+			if ( ! is_array( $data ) || empty( $data ) || ( ! $api_version && ! isset( $data['status'] ) ) ) {
 				$this->persist_place( $pid, array( 'status' => false ) );
 				$results[ $pid ] = array( 'ok' => false, 'error' => 'Empty or malformed API response' );
 				$this->log( 'error', sprintf( 'Malformed response for %s (%s)', $pid, $place['vicinity'] ?? '' ) );
 				continue;
 			}
 
-			if ( 'OK' !== $data['status'] ) {
+			if ( $api_version ) {
+				$status = isset( $data['error'] ) ? ( $data['error']['status'] ?? (string) ( $data['error']['code'] ?? 'ERROR' ) ) : 'OK';
+			} else {
+				$status = $data['status'];
+			}
+
+			if ( 'OK' !== $status ) {
 				$this->persist_place( $pid, array( 'status' => false ) );
-				$error_msg = isset( $data['error_message'] ) ? $data['error_message'] : $data['status'];
+				$error_msg = $api_version ? ( $data['error']['message'] ?? $status ) : ( $data['error_message'] ?? $status );
+				$error_msg = $this->redact_key( $error_msg );
 				$results[ $pid ] = array( 'ok' => false, 'error' => $error_msg );
-				$this->log( 'error', sprintf( 'API status "%s" for %s (%s): %s', $data['status'], $pid, $place['vicinity'] ?? '', $error_msg ) );
+				$this->log( 'error', sprintf( 'API status "%s" for %s (%s): %s', $status, $pid, $place['vicinity'] ?? '', $error_msg ) );
 				continue;
 			}
 
 			// Build the place snapshot update. Fields fall back to the
 			// stored value when absent, except rating / rating_count:
 			// when they were requested, absence means "no ratings yet".
-			$r      = $data['result'];
+			$r      = $api_version ? $this->legacy_place_fields( $data ) : $data['result'];
 			$update = array(
 				'time'   => time(),
 				'status' => isset( $r['name'] ),
@@ -183,11 +208,16 @@ class GBRR_Location_Sync {
 			if ( in_array( 'rating', $fields, true ) ) {
 				$update['rating'] = $r['rating'] ?? null;
 			}
-			if ( in_array( 'user_ratings_total', $fields, true ) ) {
+			if ( in_array( $api_version ? 'userRatingCount' : 'user_ratings_total', $fields, true ) ) {
 				$update['rating_count'] = $r['user_ratings_total'] ?? null;
 			}
 
 			$new_reviews = ( isset( $r['reviews'] ) && is_array( $r['reviews'] ) ) ? $r['reviews'] : array();
+			if ( $api_version ) {
+				$new_reviews = array_map( function( $review ) use ( $language, $translate ) {
+					return $this->legacy_review_fields( $review, $language, $translate );
+				}, array_filter( $new_reviews, 'is_array' ) );
+			}
 
 			// Saved per location (not once at the end) so a run cut short
 			// still keeps the locations it finished.
@@ -423,12 +453,40 @@ class GBRR_Location_Sync {
 				$repaired++;
 			}
 
-			if ( $repaired > 0 ) {
+			// Before 1.4.0 this plugin keyed rows by time / rating / text
+			// only, so on parent 6.x — which keys by place + author ID —
+			// each review it re-fetched got a second row the parent
+			// couldn't re-key. Drop those; the parent's row is kept.
+			$duplicates = 0;
+			if ( $this->parent_keys_by_author() ) {
+				foreach ( $reviews as $key => $row ) {
+					if ( ! is_array( $row ) || ! is_string( $row['place_id'] ?? null ) || '' === $row['place_id'] ) {
+						continue;
+					}
+					$author_id = $row['author_id'] ?? $this->review_author_id( $row['author_url'] ?? null );
+					if ( null === $author_id ) {
+						continue;
+					}
+					$author_key = $row['place_id'] . '_' . $author_id;
+					if ( $author_key !== $key && isset( $reviews[ $author_key ] ) && is_array( $reviews[ $author_key ] ) ) {
+						unset( $reviews[ $key ] );
+						$duplicates++;
+					}
+				}
+			}
+
+			if ( $duplicates > 0 ) {
+				$this->log( 'repair', sprintf( 'v%s repair: removed %d duplicate review row(s).', GBRR_SYNC_VERSION, $duplicates ) );
+			}
+
+			if ( $repaired > 0 || $duplicates > 0 ) {
 				update_option( GBRR_SYNC_OPTION_BASE . '_reviews', $reviews, 'no' );
 				wp_cache_delete( 'reviews',          GBRR_SYNC_OPTION_BASE );
 				wp_cache_delete( 'reviews_shuffled', GBRR_SYNC_OPTION_BASE );
 				delete_transient( GBRR_SYNC_OPTION_BASE . '_reviews_shuffled' );
-				$this->log( 'repair', sprintf( 'v%s repair: backfilled native row keys on %d legacy review(s).', GBRR_SYNC_VERSION, $repaired ) );
+				if ( $repaired > 0 ) {
+					$this->log( 'repair', sprintf( 'v%s repair: backfilled native row keys on %d legacy review(s).', GBRR_SYNC_VERSION, $repaired ) );
+				}
 			}
 		}
 
@@ -460,13 +518,25 @@ class GBRR_Location_Sync {
 			return $result;
 		}
 
-		$url = 'https://maps.googleapis.com/maps/api/place/details/json?' . http_build_query( array(
-			'placeid' => $place_id,
-			'key'     => $api_key,
-			'fields'  => 'name,rating',
-		) );
+		$api_version = $this->api_version();
 
-		$resp = wp_remote_get( $url, array( 'timeout' => 10 ) );
+		if ( $api_version ) {
+			$resp = wp_remote_get( 'https://places.googleapis.com/v' . $api_version . '/places/' . rawurlencode( $place_id ), array(
+				'timeout' => 10,
+				'headers' => array(
+					'X-Goog-Api-Key'   => $api_key,
+					'X-Goog-FieldMask' => 'displayName,rating',
+				),
+			) );
+		} else {
+			$url = 'https://maps.googleapis.com/maps/api/place/details/json?' . http_build_query( array(
+				'placeid' => $place_id,
+				'key'     => $api_key,
+				'fields'  => 'name,rating',
+			) );
+
+			$resp = wp_remote_get( $url, array( 'timeout' => 10 ) );
+		}
 
 		if ( is_wp_error( $resp ) ) {
 			$result['api_status'] = 'wp_error';
@@ -475,6 +545,20 @@ class GBRR_Location_Sync {
 		}
 
 		$body = json_decode( wp_remote_retrieve_body( $resp ), true );
+
+		if ( $api_version ) {
+			if ( ! is_array( $body ) ) {
+				$result['api_status'] = 'UNKNOWN';
+			} elseif ( isset( $body['error'] ) ) {
+				$result['api_status'] = $body['error']['status'] ?? (string) ( $body['error']['code'] ?? 'ERROR' );
+				$result['api_error']  = $this->redact_key( $body['error']['message'] ?? null );
+			} else {
+				$result['api_status'] = 'OK';
+				$result['place_name'] = $body['displayName']['text'] ?? null;
+			}
+			return $result;
+		}
+
 		$result['api_status'] = $body['status'] ?? 'UNKNOWN';
 		$result['place_name'] = $body['result']['name'] ?? null;
 
@@ -489,7 +573,24 @@ class GBRR_Location_Sync {
 	// Places API fetch
 	// -----------------------------------------------------------------------
 
-	private function fetch_place( $place_id, $api_key, $fields, $language, $translate ) {
+	private function fetch_place( $place_id, $api_key, $fields, $language, $translate, $api_version = null ) {
+		if ( $api_version ) {
+			// Places API (New): key and field mask go in headers, and it
+			// has no review sort or no-translations parameter.
+			$url = 'https://places.googleapis.com/v' . $api_version . '/places/' . rawurlencode( $place_id );
+			if ( ! empty( $language ) ) {
+				$url .= '?languageCode=' . rawurlencode( $language );
+			}
+
+			return wp_remote_get( $url, array(
+				'timeout' => 15,
+				'headers' => array(
+					'X-Goog-Api-Key'   => $api_key,
+					'X-Goog-FieldMask' => implode( ',', $fields ),
+				),
+			) );
+		}
+
 		$args = array(
 			'placeid'                 => $place_id,
 			'key'                     => $api_key,
@@ -504,6 +605,117 @@ class GBRR_Location_Sync {
 		$url = 'https://maps.googleapis.com/maps/api/place/details/json?' . http_build_query( $args );
 
 		return wp_remote_get( $url, array( 'timeout' => 15 ) );
+	}
+
+	/**
+	 * The Places API version the parent plugin uses: 1 for Places API
+	 * (New), null for the legacy Place Details API. Parent 6.x stores it
+	 * in `_api_version`; older parents never set it.
+	 */
+	private function api_version() {
+		$version = get_option( GBRR_SYNC_OPTION_BASE . '_api_version', null );
+		return ( is_numeric( $version ) && intval( $version ) >= 1 ) ? intval( $version ) : null;
+	}
+
+	/**
+	 * Maps a Places API (New) place to the legacy `result` keys the rest
+	 * of the sync reads, the same way the parent fills `_places` from it.
+	 */
+	private function legacy_place_fields( $data ) {
+		$r = array();
+		if ( isset( $data['displayName']['text'] ) ) {
+			$r['name'] = $data['displayName']['text'];
+		}
+		if ( isset( $data['formattedAddress'] ) ) {
+			$r['formatted_address'] = $data['formattedAddress'];
+		}
+		if ( isset( $data['shortFormattedAddress'] ) ) {
+			$r['vicinity'] = $data['shortFormattedAddress'];
+		}
+		if ( ! empty( $data['iconMaskBaseUri'] ) ) {
+			$r['icon'] = $data['iconMaskBaseUri'] . '.svg';
+		}
+		if ( isset( $data['rating'] ) ) {
+			$r['rating'] = $data['rating'];
+		}
+		if ( isset( $data['userRatingCount'] ) ) {
+			$r['user_ratings_total'] = $data['userRatingCount'];
+		}
+		if ( isset( $data['reviews'] ) ) {
+			$r['reviews'] = $data['reviews'];
+		}
+		return $r;
+	}
+
+	/**
+	 * Maps a Places API (New) review to the legacy review keys
+	 * merge_reviews() reads, following the parent 6.x set_reviews():
+	 * text is the original unless a translation into the site language
+	 * was asked for, and `key_text` / `extra` carry what only the new
+	 * API has (key input and the extra native row keys).
+	 */
+	private function legacy_review_fields( $review, $language, $translate ) {
+		$original   = ( isset( $review['originalText'] ) && is_array( $review['originalText'] ) ) ? $review['originalText'] : array();
+		$shown      = ( isset( $review['text'] ) && is_array( $review['text'] ) ) ? $review['text'] : array();
+		$author     = ( isset( $review['authorAttribution'] ) && is_array( $review['authorAttribution'] ) ) ? $review['authorAttribution'] : array();
+		$text       = is_string( $original['text'] ?? null ) ? $original['text'] : null;
+		$lang       = is_string( $original['languageCode'] ?? null ) ? $original['languageCode'] : null;
+		$translated = isset( $shown['languageCode'], $original['languageCode'] ) && $shown['languageCode'] !== $original['languageCode'];
+
+		if ( ! empty( $language ) && $translate && $translated
+			&& ( $shown['languageCode'] === $language || $shown['languageCode'] === preg_replace( '/^([a-z]{2}l?).*/i', '$1', $language ) ) ) {
+			$text = is_string( $shown['text'] ?? null ) ? $shown['text'] : null;
+			$lang = $language;
+		}
+
+		$original_text = ( null !== $text && is_string( $original['text'] ?? null ) && $original['text'] !== $text ) ? $original['text'] : null;
+		$rating        = ( isset( $review['rating'] ) && is_numeric( $review['rating'] ) && $review['rating'] >= 1 && $review['rating'] <= 5 ) ? intval( $review['rating'] ) : null;
+		$time          = isset( $review['publishTime'] ) ? ( strtotime( $review['publishTime'] ) ?: null ) : null;
+		$visit_date    = null;
+		if ( isset( $review['visitDate'] ) && is_array( $review['visitDate'] ) ) {
+			$visit_date = array(
+				'year'  => is_numeric( $review['visitDate']['year'] ?? null ) ? intval( $review['visitDate']['year'] ) : null,
+				'month' => is_numeric( $review['visitDate']['month'] ?? null ) ? intval( $review['visitDate']['month'] ) : null,
+			);
+		}
+
+		return array(
+			'author_name'               => is_string( $author['displayName'] ?? null ) ? $author['displayName'] : null,
+			'author_url'                => is_string( $author['uri'] ?? null ) ? $author['uri'] : null,
+			'profile_photo_url'         => is_string( $author['photoUri'] ?? null ) ? $author['photoUri'] : null,
+			'language'                  => ( null !== $text ) ? $lang : null,
+			'rating'                    => $rating,
+			'relative_time_description' => $review['relativePublishTimeDescription'] ?? '',
+			'text'                      => $text,
+			'time'                      => $time,
+			'translated'                => $translated,
+			'status'                    => null !== $rating,
+			'key_text'                  => is_string( $original['text'] ?? null ) ? $original['text'] : '',
+			'extra'                     => array(
+				'reference'         => is_string( $review['name'] ?? null ) ? $review['name'] : null,
+				'original_language' => is_string( $original['languageCode'] ?? null ) ? $original['languageCode'] : null,
+				'original_text'     => $original_text,
+				'review_url'        => is_string( $review['googleMapsUri'] ?? null ) ? $review['googleMapsUri'] : null,
+				'visit_date'        => $visit_date,
+			),
+		);
+	}
+
+	/**
+	 * Whether the parent keys review rows by place + author ID
+	 * (`set_review_identity()`, added in parent 6.0) rather than only by
+	 * time / rating / text.
+	 */
+	private function parent_keys_by_author() {
+		return method_exists( 'google_business_reviews_rating', 'set_review_identity' );
+	}
+
+	/**
+	 * The parent's author ID for a review: the long number in its Google
+	 * Maps contributor URL, or null.
+	 */
+	private function review_author_id( $author_url ) {
+		return ( is_string( $author_url ) && preg_match( '/(\d{20,120})/', $author_url, $m ) ) ? $m[1] : null;
 	}
 
 	// -----------------------------------------------------------------------
@@ -522,16 +734,34 @@ class GBRR_Location_Sync {
 			}
 		}
 
+		$by_author = $this->parent_keys_by_author();
+
 		foreach ( $new_reviews as $review ) {
 			if ( ! isset( $review['time'], $review['rating'], $review['author_name'] ) ) {
 				continue;
 			}
-			// Must match the parent plugin's own key formula exactly
-			// (time_rating_md5(author+text)) or every review we write
-			// gets treated as unrecognized on the parent's next hourly
-			// sync and re-keyed via its slower author-matching fallback.
-			$key = $review['time'] . '_' . $review['rating'] . '_' . md5( $review['author_name'] . '_' . mb_substr( (string) ( $review['text'] ?? '' ), 0, 100 ) );
-			$row = ( isset( $existing[ $key ] ) && is_array( $existing[ $key ] ) ) ? $existing[ $key ] : array();
+			// Must match the parent plugin's own key formula exactly, or
+			// the review gets stored twice. Parent 6.x keys by place +
+			// author ID (set_review_identity()) and re-keys every row to
+			// that on load; without an author ID, and on 5.x, it's
+			// time_rating_md5(author+text).
+			$author_id    = $this->review_author_id( $review['author_url'] ?? null );
+			$author_key   = ( null !== $author_id ) ? $place_id . '_' . $author_id : null;
+			$fallback_key = $review['time'] . '_' . $review['rating'] . '_' . md5( $review['author_name'] . '_' . mb_substr( (string) ( $review['key_text'] ?? $review['text'] ?? '' ), 0, 100 ) );
+			$key          = ( $by_author && null !== $author_key ) ? $author_key : $fallback_key;
+
+			// Find the row under either key, moving it if it's under the
+			// one the parent no longer uses.
+			$row = array();
+			foreach ( array_filter( array( $author_key, $fallback_key ) ) as $candidate ) {
+				if ( isset( $existing[ $candidate ] ) && is_array( $existing[ $candidate ] ) ) {
+					$row = $existing[ $candidate ];
+					if ( $candidate !== $key ) {
+						unset( $existing[ $candidate ] );
+					}
+					break;
+				}
+			}
 
 			$next_id = null;
 			if ( empty( $row ) ) {
@@ -539,7 +769,15 @@ class GBRR_Location_Sync {
 				$next_id = $max_id;
 			}
 
-			$existing[ $key ] = $this->normalize_review_row( $row, $review, $place_id, $next_id );
+			$extra = ( isset( $review['extra'] ) && is_array( $review['extra'] ) ) ? $review['extra'] : array();
+			if ( isset( $review['original_language'] ) ) {
+				$extra['original_language'] = $review['original_language'];
+			}
+			if ( $by_author ) {
+				$extra = array( 'author_id' => $author_id ) + $extra;
+			}
+
+			$existing[ $key ] = $this->normalize_review_row( $row, $review, $place_id, $next_id, $extra );
 		}
 		return $existing;
 	}
@@ -557,8 +795,11 @@ class GBRR_Location_Sync {
 	 * $next_id is only used when $row is empty (a genuinely new
 	 * review) — it must be pre-computed by the caller as
 	 * max(existing ids) + 1, matching the parent's own id assignment.
+	 *
+	 * $extra holds native keys only some parents / APIs have (author_id,
+	 * and the Places API (New) reference, original_text, …).
 	 */
-	private function normalize_review_row( $row, $review, $place_id, $next_id = null ) {
+	private function normalize_review_row( $row, $review, $place_id, $next_id = null, $extra = array() ) {
 		$is_new = empty( $row );
 
 		$normalized = array(
@@ -570,7 +811,7 @@ class GBRR_Location_Sync {
 			'imported'                  => $row['imported'] ?? ( $is_new ? false : null ),
 			'time_estimate'             => $row['time_estimate'] ?? false,
 			'removable'                 => $row['removable'] ?? false,
-			'status'                    => $row['status'] ?? true,
+			'status'                    => $review['status'] ?? ( $row['status'] ?? true ),
 			'profile_photo_url'         => $review['profile_photo_url'] ?? ( $row['profile_photo_url'] ?? '' ),
 			'author_name'               => $review['author_name'] ?? ( $row['author_name'] ?? '' ),
 			'author_url'                => $review['author_url'] ?? ( $row['author_url'] ?? '' ),
@@ -581,6 +822,8 @@ class GBRR_Location_Sync {
 			'time'                      => $review['time'] ?? ( $row['time'] ?? null ),
 			'translated'                => $review['translated'] ?? ( $row['translated'] ?? false ),
 		);
+
+		$normalized = array_merge( $normalized, $extra );
 
 		// Preserve the parent plugin's locally cached avatar filename if it exists.
 		if ( isset( $row['avatar'] ) ) {

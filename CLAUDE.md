@@ -19,9 +19,18 @@ Project notes for Claude Code working in this repo.
 - The plugin writes straight into the **parent plugin's own options**
   (`google_business_reviews_rating_places`, `_reviews`, `_result`, `_result_valid`, …).
   Row shapes must match what the parent's native code produces — see `merge_reviews()` /
-  `normalize_review_row()`, which were audited against the parent's `index.php` (v5.10).
-  Before changing how parent options are read or written, get a copy of the parent's source
-  and check against it; past mismatches were non-obvious.
+  `normalize_review_row()`, last audited against parent 6.1 (`index.php` `set_reviews()` /
+  `set_review_identity()`, `dashboard/sync.php` `retrieve_data()`).
+  Before changing how parent options are read or written, get the current parent release from
+  wordpress.org (not a copy from a site folder under `C:\www`, which is usually stale) and check
+  against it; past mismatches were non-obvious.
+- Parent 6.x has two API modes, set by `_api_version`: empty means the legacy Place Details
+  API, `1` means Places API (New), which uses different field names, headers and response
+  shape. Fresh 6.x installs default to `1`; sites upgraded from 5.x stay legacy. Every request
+  this plugin makes must follow that option (`api_version()`).
+- Parent 6.x keys review rows `<place_id>_<author id>` and re-keys stored rows to that on
+  load; 5.x (and 6.x without an author ID) uses `time_rating_md5(author_text)`. A key that
+  doesn't match the parent's makes a duplicate row. `parent_keys_by_author()` detects 6.x.
 - The parent's hourly sync can write the same options while our requests are in flight.
   `run_sync()` therefore saves each location as soon as it's fetched via `persist_place()`,
   which re-reads the options with `fresh_option()` (bypassing the request's option cache)

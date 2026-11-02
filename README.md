@@ -6,6 +6,7 @@ A small WordPress helper plugin for [Reviews and Rating – Google Reviews](http
 
 - Automatically syncs **all** saved Google Business locations once a day via WP-Cron, instead of only the single active/default location the parent plugin refreshes.
 - Merges newly fetched reviews into the parent plugin's review store, preserving the row shape the parent expects (`checked`, `order`, `avatar`, etc.) so its "recently checked" guard doesn't re-process every row and re-fetch avatars on each run.
+- Works with both of the parent's Google API modes: the legacy Place Details API and Places API (New), which parent 6.x uses by default on new installs. It follows whichever one the parent is set to.
 - Fixes the duplicate-default-location bug that can occur after a manual location cycle by re-deriving the `default` flag on every saved location from the active place ID.
 - Adds an admin settings page (**Settings → GBRR Sync**) showing:
   - Next scheduled sync time
