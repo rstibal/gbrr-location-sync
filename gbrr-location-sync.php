@@ -1114,6 +1114,7 @@ class GBRR_Location_Sync {
 			<table class="widefat striped" style="margin-bottom:28px;">
 				<thead>
 					<tr>
+						<th style="width:50px;">ID</th>
 						<th style="width:110px;">Date</th>
 						<th style="width:90px;">Rating</th>
 						<th style="width:180px;">Author</th>
@@ -1128,6 +1129,7 @@ class GBRR_Location_Sync {
 						$text   = $review['text'] ?? '';
 					?>
 					<tr>
+						<td><?php echo isset( $review['id'] ) && is_numeric( $review['id'] ) ? esc_html( (int) $review['id'] ) : '&mdash;'; ?></td>
 						<td><?php echo ! empty( $review['time'] ) && is_numeric( $review['time'] ) ? esc_html( gmdate( 'Y-m-d', (int) $review['time'] ) ) : '&mdash;'; ?></td>
 						<td><?php echo null !== $rating ? '<span style="color:#dba617;" title="' . esc_attr( $rating . ' of 5' ) . '">' . str_repeat( '&#9733;', $rating ) . '</span>' . str_repeat( '&#9734;', 5 - $rating ) : '&mdash;'; ?></td>
 						<td>

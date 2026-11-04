@@ -11,7 +11,7 @@ A small WordPress helper plugin for [Reviews and Rating – Google Reviews](http
 - Adds an admin settings page (**Settings → GBRR Sync**) showing:
   - Next scheduled sync time
   - Per-location status (rating, review count on Google, last synced, OK/FAIL)
-  - How many reviews are stored for each location, linked to a list of those reviews (date, rating, author, text, and whether each is shown or hidden)
+  - How many reviews are stored for each location, linked to a list of those reviews (ID, date, rating, author, text, and whether each is shown or hidden)
   - A manual "Sync All Locations Now" action
   - A Google Places API connection/key test
   - A rolling sync log (last 500 entries, most recent 50 shown)
