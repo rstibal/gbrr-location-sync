@@ -27,7 +27,10 @@ Project notes for Claude Code working in this repo.
 - Parent 6.x has two API modes, set by `_api_version`: empty means the legacy Place Details
   API, `1` means Places API (New), which uses different field names, headers and response
   shape. Fresh 6.x installs default to `1`; sites upgraded from 5.x stay legacy. Every request
-  this plugin makes must follow that option (`api_version()`).
+  this plugin makes must follow that option (`api_version()`). A Google error like
+  `Unsupported field name 'displayName'` (or a legacy field name rejected by the new API)
+  means a request went to the wrong API for the site's mode. It says nothing about the
+  API key: one key with both APIs enabled is shared across sites in different modes.
 - Parent 6.x keys review rows `<place_id>_<author id>` and re-keys stored rows to that on
   load; 5.x (and 6.x without an author ID) uses `time_rating_md5(author_text)`. A key that
   doesn't match the parent's makes a duplicate row. `parent_keys_by_author()` detects 6.x.
@@ -36,7 +39,9 @@ Project notes for Claude Code working in this repo.
   which re-reads the options with `fresh_option()` (bypassing the request's option cache)
   and merges in only that location's changes. Don't go back to read-once / write-at-end.
 - `maybe_repair_reviews()` re-runs whenever `GBRR_SYNC_VERSION` changes; it must stay
-  idempotent (it skips rows that already have a `checked` key).
+  idempotent. It backfills missing keys (skipping rows that already have a `checked` key)
+  and, on parent 6.x, removes rows that duplicate a `<place_id>_<author id>` row under
+  another key (left by versions before 1.4.0), keeping the parent's row.
 - Plugin-owned options: `gbrr_location_sync_log`, `gbrr_sync_db_version`,
   `gbrr_location_sync_notify_enabled`, `gbrr_location_sync_notify_email`.
   Admin page: **Settings → GBRR Sync** (`options-general.php?page=gbrr-location-sync`).
@@ -48,6 +53,14 @@ There's no test suite. At minimum run `php -l gbrr-location-sync.php` (PHP is at
 For behavior checks, a throwaway script that stubs the WordPress functions it touches
 (`get_option`, `update_option`, `wp_remote_get`, …) and `require`s the plugin works well;
 note the `admin_post` handlers end in `exit`, so check their results in a shutdown function.
+Cover both API modes (legacy and `_api_version` = 1) and both parent generations (5.x keying
+and 6.x keying, toggled by whether `google_business_reviews_rating::set_review_identity`
+exists). `_api_version` = 1 only occurs with parent 6.x, so skip that pairing with 5.x.
+Remember the fallback review key has no place ID, so identical mock reviews at two
+locations collapse into one row.
+
+The user tests the local zip on their live sites before anything is pushed or released.
+Commit, then wait for them to say to push and release.
 
 ## Releases
 
@@ -62,7 +75,8 @@ Bump the `Version:` header and `GBRR_SYNC_VERSION`, commit, push, then publish a
 release tagged `vX.Y.Z`. `.github/workflows/release.yml` builds the zip on `ubuntu-latest`,
 fails if the tag doesn't match the header or any zip entry contains a backslash, and
 attaches the zip to the release. The zip contains only `gbrr-location-sync.php`,
-`README.md` and `LICENSE`.
+`README.md` and `LICENSE`. After the workflow finishes, download the release zip
+(`gh release download vX.Y.Z`) and check its files match the local zip the user tested.
 
 **Never build a zip on Windows with `Compress-Archive`** (or similar): it writes backslashes
 into entry names, and the plugin then installs broken on Linux hosts. This has broken a real
