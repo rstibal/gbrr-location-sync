@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.5.0
+ * Version:     1.5.1
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.5.0' );
+define( 'GBRR_SYNC_VERSION',     '1.5.1' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
@@ -1107,6 +1107,10 @@ class GBRR_Location_Sync {
 			<h2 id="gbrr-reviews">Retrieved Reviews: <?php echo esc_html( $view_place['name'] ?? $view_pid ); ?>
 				<small style="font-weight:normal;font-size:13px;margin-left:8px;"><a href="<?php echo esc_url( $page_url ); ?>">Close</a></small>
 			</h2>
+			<?php $view_address = $view_place['vicinity'] ?? $view_place['formatted_address'] ?? '';
+			if ( '' !== $view_address ) : ?>
+				<p style="margin-top:-8px;color:#666;"><?php echo esc_html( $view_address ); ?></p>
+			<?php endif; ?>
 			<p class="description">The reviews stored for this location by Reviews and Rating, newest first. Hide or reorder them on the plugin's own <a href="<?php echo esc_url( admin_url( 'options-general.php?page=google_business_reviews_rating_settings' ) ); ?>">Reviews tab</a>.</p>
 			<?php if ( empty( $view_reviews ) ) : ?>
 				<p>No reviews are stored for this location yet.</p>
