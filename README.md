@@ -10,7 +10,8 @@ A small WordPress helper plugin for [Reviews and Rating – Google Reviews](http
 - Fixes the duplicate-default-location bug that can occur after a manual location cycle by re-deriving the `default` flag on every saved location from the active place ID.
 - Adds an admin settings page (**Settings → GBRR Sync**) showing:
   - Next scheduled sync time
-  - Per-location status (rating, review count, last synced, OK/FAIL)
+  - Per-location status (rating, review count on Google, last synced, OK/FAIL)
+  - How many reviews are stored for each location, linked to a list of those reviews (date, rating, author, text, and whether each is shown or hidden)
   - A manual "Sync All Locations Now" action
   - A Google Places API connection/key test
   - A rolling sync log (last 500 entries, most recent 50 shown)

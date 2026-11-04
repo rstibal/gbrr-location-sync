@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.4.0
+ * Version:     1.5.0
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.4.0' );
+define( 'GBRR_SYNC_VERSION',     '1.5.0' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
@@ -896,6 +896,30 @@ class GBRR_Location_Sync {
 			$log = array();
 		}
 
+		// Stored (retrieved) reviews, counted per location, plus the location picked
+		// for the review list below the grid (?reviews=<place id>).
+		$reviews = get_option( GBRR_SYNC_OPTION_BASE . '_reviews', array() );
+		if ( ! is_array( $reviews ) ) {
+			$reviews = array();
+		}
+		$review_counts = array();
+		foreach ( $reviews as $review ) {
+			if ( is_array( $review ) && isset( $review['place_id'] ) && is_string( $review['place_id'] ) ) {
+				$review_counts[ $review['place_id'] ] = ( $review_counts[ $review['place_id'] ] ?? 0 ) + 1;
+			}
+		}
+		$view_place = null;
+		if ( isset( $_GET['reviews'] ) && is_string( $_GET['reviews'] ) ) {
+			$requested = sanitize_text_field( wp_unslash( $_GET['reviews'] ) );
+			foreach ( $places as $p ) {
+				if ( isset( $p['place_id'] ) && $p['place_id'] === $requested ) {
+					$view_place = $p;
+					break;
+				}
+			}
+		}
+		$page_url = admin_url( 'options-general.php?page=gbrr-location-sync' );
+
 		$flash      = get_transient( 'gbrr_sync_flash' );
 		$conn_result = get_transient( 'gbrr_conn_result' );
 		delete_transient( 'gbrr_sync_flash' );
@@ -1015,7 +1039,8 @@ class GBRR_Location_Sync {
 						<th>Name / Address</th>
 						<th>Place ID</th>
 						<th>Rating</th>
-						<th>Reviews</th>
+						<th>Reviews on Google</th>
+						<th>Retrieved</th>
 						<th>Last Synced</th>
 						<th>Status</th>
 						<th>Default</th>
@@ -1036,6 +1061,14 @@ class GBRR_Location_Sync {
 						<td><code style="font-size:11px;"><?php echo esc_html( $pid ); ?></code></td>
 						<td><?php echo isset( $p['rating'] ) && $p['rating'] !== null ? esc_html( $p['rating'] ) . ' &#9733;' : '&mdash;'; ?></td>
 						<td><?php echo isset( $p['rating_count'] ) && $p['rating_count'] !== null ? esc_html( number_format( $p['rating_count'] ) ) : '&mdash;'; ?></td>
+						<td>
+							<?php $retrieved = $review_counts[ $pid ] ?? 0;
+							if ( $retrieved > 0 ) : ?>
+								<a href="<?php echo esc_url( add_query_arg( 'reviews', rawurlencode( $pid ), $page_url ) . '#gbrr-reviews' ); ?>"><?php echo esc_html( number_format( $retrieved ) . ( 1 === $retrieved ? ' review' : ' reviews' ) ); ?></a>
+							<?php else : ?>
+								0
+							<?php endif; ?>
+						</td>
 						<td>
 							<?php if ( $age_h !== null ) :
 								echo $age_h < 1
@@ -1059,6 +1092,63 @@ class GBRR_Location_Sync {
 					<?php endforeach; ?>
 				</tbody>
 			</table>
+			<?php endif; ?>
+
+			<?php if ( $view_place ) :
+				$view_pid     = $view_place['place_id'];
+				$view_reviews = array_filter( $reviews, function ( $review ) use ( $view_pid ) {
+					return is_array( $review ) && ( $review['place_id'] ?? null ) === $view_pid;
+				} );
+				uasort( $view_reviews, function ( $a, $b ) {
+					return (int) ( $b['time'] ?? 0 ) <=> (int) ( $a['time'] ?? 0 );
+				} );
+			?>
+			<!-- Retrieved reviews for one location -->
+			<h2 id="gbrr-reviews">Retrieved Reviews: <?php echo esc_html( $view_place['name'] ?? $view_pid ); ?>
+				<small style="font-weight:normal;font-size:13px;margin-left:8px;"><a href="<?php echo esc_url( $page_url ); ?>">Close</a></small>
+			</h2>
+			<p class="description">The reviews stored for this location by Reviews and Rating, newest first. Hide or reorder them on the plugin's own <a href="<?php echo esc_url( admin_url( 'options-general.php?page=google_business_reviews_rating_settings' ) ); ?>">Reviews tab</a>.</p>
+			<?php if ( empty( $view_reviews ) ) : ?>
+				<p>No reviews are stored for this location yet.</p>
+			<?php else : ?>
+			<table class="widefat striped" style="margin-bottom:28px;">
+				<thead>
+					<tr>
+						<th style="width:110px;">Date</th>
+						<th style="width:90px;">Rating</th>
+						<th style="width:180px;">Author</th>
+						<th>Review</th>
+						<th style="width:80px;">Shown</th>
+					</tr>
+				</thead>
+				<tbody>
+					<?php foreach ( $view_reviews as $review ) :
+						$rating = isset( $review['rating'] ) && is_numeric( $review['rating'] ) ? max( 0, min( 5, (int) $review['rating'] ) ) : null;
+						$author = $review['author_name'] ?? '';
+						$text   = $review['text'] ?? '';
+					?>
+					<tr>
+						<td><?php echo ! empty( $review['time'] ) && is_numeric( $review['time'] ) ? esc_html( gmdate( 'Y-m-d', (int) $review['time'] ) ) : '&mdash;'; ?></td>
+						<td><?php echo null !== $rating ? '<span style="color:#dba617;" title="' . esc_attr( $rating . ' of 5' ) . '">' . str_repeat( '&#9733;', $rating ) . '</span>' . str_repeat( '&#9734;', 5 - $rating ) : '&mdash;'; ?></td>
+						<td>
+							<?php if ( ! empty( $review['author_url'] ) ) : ?>
+								<a href="<?php echo esc_url( $review['author_url'] ); ?>" target="_blank" rel="noopener noreferrer"><?php echo esc_html( '' !== $author ? $author : 'Unknown' ); ?></a>
+							<?php else : ?>
+								<?php echo esc_html( '' !== $author ? $author : 'Unknown' ); ?>
+							<?php endif; ?>
+						</td>
+						<td>
+							<?php echo '' !== $text ? nl2br( esc_html( $text ) ) : '<em style="color:#666;">No text (rating only)</em>'; ?>
+							<?php if ( ! empty( $review['review_url'] ) ) : ?>
+								<br><a href="<?php echo esc_url( $review['review_url'] ); ?>" target="_blank" rel="noopener noreferrer" style="font-size:12px;">View on Google</a>
+							<?php endif; ?>
+						</td>
+						<td><?php echo ! empty( $review['status'] ) ? '<span style="color:#00a32a;">Yes</span>' : '<span style="color:#666;">Hidden</span>'; ?></td>
+					</tr>
+					<?php endforeach; ?>
+				</tbody>
+			</table>
+			<?php endif; ?>
 			<?php endif; ?>
 
 			<!-- Log -->
