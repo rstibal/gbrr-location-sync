@@ -38,6 +38,13 @@ Project notes for Claude Code working in this repo.
   `run_sync()` therefore saves each location as soon as it's fetched via `persist_place()`,
   which re-reads the options with `fresh_option()` (bypassing the request's option cache)
   and merges in only that location's changes. Don't go back to read-once / write-at-end.
+- Every write of the whole review store goes through `read_stored_reviews()`, which reads
+  the row straight from the database. `get_option()` returns its default both when the
+  store doesn't exist and when it can't be read (failed query, data that won't
+  unserialize); treating an unreadable store as empty and saving erased about 3,800
+  imported reviews on injurylawyers.com in Nov 2026 (the store was ~4–5 MB). Refuse to
+  write on a read error, re-read after writing, and put the previous bytes back if the
+  new value doesn't read back. The parent's own writes don't have this check.
 - `maybe_repair_reviews()` re-runs whenever `GBRR_SYNC_VERSION` changes; it must stay
   idempotent. It backfills missing keys (skipping rows that already have a `checked` key)
   and, on parent 6.x, removes rows that duplicate a `<place_id>_<author id>` row under

@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.5.1
+ * Version:     1.5.2
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.5.1' );
+define( 'GBRR_SYNC_VERSION',     '1.5.2' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
@@ -221,7 +221,13 @@ class GBRR_Location_Sync {
 
 			// Saved per location (not once at the end) so a run cut short
 			// still keeps the locations it finished.
-			$this->persist_place( $pid, $update, $new_reviews, $data );
+			$reviews_error = $this->persist_place( $pid, $update, $new_reviews, $data );
+			if ( null !== $reviews_error ) {
+				$error_msg       = 'Reviews not saved: ' . $reviews_error . '. Stored reviews were left as they were.';
+				$results[ $pid ] = array( 'ok' => false, 'error' => $error_msg );
+				$this->log( 'error', sprintf( '%s (%s): %s', $pid, $place['vicinity'] ?? '', $error_msg ) );
+				continue;
+			}
 
 			$results[ $pid ] = array(
 				'ok'           => true,
@@ -291,16 +297,33 @@ class GBRR_Location_Sync {
 		}
 		update_option( GBRR_SYNC_OPTION_BASE . '_places', $places, 'yes' );
 
+		$reviews_error = null;
 		if ( ! empty( $new_reviews ) ) {
-			$reviews_all = $this->fresh_option( GBRR_SYNC_OPTION_BASE . '_reviews', array() );
-			if ( ! is_array( $reviews_all ) ) {
-				$reviews_all = array();
+			// Never build on a store we couldn't read: saving "nothing + the
+			// few reviews Google returned" over it erases every stored review.
+			$store = $this->read_stored_reviews();
+			if ( isset( $store['error'] ) ) {
+				$reviews_error = $store['error'];
+			} else {
+				$reviews_all = $this->merge_reviews( $store['reviews'], $new_reviews, $pid );
+				update_option( GBRR_SYNC_OPTION_BASE . '_reviews', $reviews_all, 'no' );
+
+				// Large stores can save in a form that doesn't read back
+				// (the parent's own import checks for this too). If ours
+				// didn't, put the previous bytes back.
+				$check = $this->read_stored_reviews();
+				if ( isset( $check['error'] ) ) {
+					if ( null !== $store['raw'] ) {
+						global $wpdb;
+						$wpdb->update( $wpdb->options, array( 'option_value' => $store['raw'] ), array( 'option_name' => GBRR_SYNC_OPTION_BASE . '_reviews' ) );
+					}
+					wp_cache_delete( GBRR_SYNC_OPTION_BASE . '_reviews', 'options' );
+					$reviews_error = 'the saved reviews did not read back (' . $check['error'] . '), so the previous copy was put back';
+				}
+				wp_cache_delete( 'reviews',          GBRR_SYNC_OPTION_BASE );
+				wp_cache_delete( 'reviews_shuffled', GBRR_SYNC_OPTION_BASE );
+				delete_transient( GBRR_SYNC_OPTION_BASE . '_reviews_shuffled' );
 			}
-			$reviews_all = $this->merge_reviews( $reviews_all, $new_reviews, $pid );
-			update_option( GBRR_SYNC_OPTION_BASE . '_reviews', $reviews_all, 'no' );
-			wp_cache_delete( 'reviews',          GBRR_SYNC_OPTION_BASE );
-			wp_cache_delete( 'reviews_shuffled', GBRR_SYNC_OPTION_BASE );
-			delete_transient( GBRR_SYNC_OPTION_BASE . '_reviews_shuffled' );
 		}
 
 		// Refresh _result for the active/default location
@@ -310,6 +333,42 @@ class GBRR_Location_Sync {
 			wp_cache_delete( 'result',       GBRR_SYNC_OPTION_BASE );
 			wp_cache_delete( 'result_valid', GBRR_SYNC_OPTION_BASE );
 		}
+
+		return $reviews_error;
+	}
+
+	/**
+	 * Reads the parent's review store straight from the database,
+	 * bypassing every cache.
+	 *
+	 * get_option() returns its default both when the option doesn't exist
+	 * and when the stored value can't be read (a failed query, or
+	 * serialized data that no longer unserializes). Only the first means
+	 * "no reviews yet"; treating the second the same way and saving would
+	 * erase the whole store. Returns ['reviews' => array, 'raw' => ?string]
+	 * or ['error' => string].
+	 */
+	private function read_stored_reviews() {
+		global $wpdb;
+		$raw = $wpdb->get_var( $wpdb->prepare(
+			"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+			GBRR_SYNC_OPTION_BASE . '_reviews'
+		) );
+		if ( null === $raw ) {
+			if ( '' !== (string) $wpdb->last_error ) {
+				return array( 'error' => 'database error reading the stored reviews: ' . $wpdb->last_error );
+			}
+			return array( 'reviews' => array(), 'raw' => null ); // No store yet.
+		}
+		$value = maybe_unserialize( $raw );
+		if ( is_array( $value ) ) {
+			return array( 'reviews' => $value, 'raw' => $raw );
+		}
+		// The parent stores an emptied store as '' (NULL) or an empty value.
+		if ( in_array( trim( (string) $raw ), array( '', 'N;', 'b:0;', 's:0:"";' ), true ) ) {
+			return array( 'reviews' => array(), 'raw' => $raw );
+		}
+		return array( 'error' => sprintf( 'the stored reviews (%s bytes) could not be read', number_format( strlen( $raw ) ) ) );
 	}
 
 	/**
@@ -432,9 +491,21 @@ class GBRR_Location_Sync {
 			return;
 		}
 
-		$reviews = get_option( GBRR_SYNC_OPTION_BASE . '_reviews', array() );
+		$store = $this->read_stored_reviews();
+		if ( isset( $store['error'] ) ) {
+			// Try again on a later admin page load rather than write over
+			// it. Log it once, not on every page load.
+			$message = sprintf( 'v%s repair skipped: %s. Stored reviews were left as they were.', GBRR_SYNC_VERSION, $store['error'] );
+			$log     = get_option( GBRR_SYNC_LOG_OPTION, array() );
+			$last    = is_array( $log ) && ! empty( $log ) ? end( $log ) : null;
+			if ( ( $last['message'] ?? null ) !== $message ) {
+				$this->log( 'error', $message );
+			}
+			return;
+		}
+		$reviews = $store['reviews'];
 
-		if ( is_array( $reviews ) && ! empty( $reviews ) ) {
+		if ( ! empty( $reviews ) ) {
 			$repaired = 0;
 
 			foreach ( $reviews as $key => $row ) {

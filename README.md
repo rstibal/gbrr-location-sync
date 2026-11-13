@@ -61,6 +61,7 @@ way.
 
 - This plugin reads its configuration (API key, saved locations, active place ID) directly from the parent plugin's options — it has no settings of its own beyond scheduling.
 - API keys are redacted from any logged error messages.
+- If the stored reviews can't be read (a database error, or data that no longer unserializes), the sync refuses to save over them and reports those locations as failed, instead of replacing the store with only the few reviews Google returns. After saving, it checks the reviews read back and restores the previous copy if they don't.
 
 ## License
 
