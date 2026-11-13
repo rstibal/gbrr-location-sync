@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.6.0
+ * Version:     1.7.0
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.6.0' );
+define( 'GBRR_SYNC_VERSION',     '1.7.0' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
@@ -25,6 +25,8 @@ define( 'GBRR_SYNC_NOTIFY_EMAIL_OPTION',   'gbrr_location_sync_notify_email' );
 define( 'GBRR_SYNC_BACKUPS_OPTION',        'gbrr_location_sync_backups' );
 define( 'GBRR_SYNC_KNOWN_COUNT_OPTION',    'gbrr_location_sync_reviews_known' );
 define( 'GBRR_SYNC_BACKUPS_KEEP',          7 );
+define( 'GBRR_SYNC_HIDE_PARENT_OPTION',    'gbrr_location_sync_hide_parent_reviews' );
+define( 'GBRR_SYNC_REVIEWS_PER_PAGE',      100 );
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -62,6 +64,8 @@ class GBRR_Location_Sync {
 		add_action( 'admin_post_gbrr_conn_test',   array( $this, 'handle_conn_test' ) );
 		add_action( 'admin_post_gbrr_save_notify', array( $this, 'handle_save_notify' ) );
 		add_action( 'admin_init',                  array( $this, 'maybe_repair_reviews' ) );
+		add_action( 'admin_post_gbrr_save_display', array( $this, 'handle_save_display' ) );
+		add_action( 'admin_init',                  array( $this, 'maybe_hide_parent_reviews' ) );
 		add_action( 'admin_post_gbrr_backup_now',  array( $this, 'handle_backup_now' ) );
 		add_action( 'admin_post_gbrr_restore_backup', array( $this, 'handle_restore_backup' ) );
 		// Checks every save of the review store, the parent plugin's included.
@@ -1410,6 +1414,23 @@ class GBRR_Location_Sync {
 			</div>
 			<?php endif; ?>
 
+			<!-- Parent plugin's Reviews tab -->
+			<h2 style="margin-top:24px;">Reviews and Rating: Reviews Tab</h2>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="background:#fff;border:1px solid #c3c4c7;border-radius:4px;padding:16px 20px;margin-bottom:28px;max-width:640px;">
+				<?php wp_nonce_field( 'gbrr_save_display', 'gbrr_display_nonce' ); ?>
+				<input type="hidden" name="action" value="gbrr_save_display">
+				<p>
+					<label>
+						<input type="checkbox" name="gbrr_hide_parent_reviews" value="1" <?php checked( get_option( GBRR_SYNC_HIDE_PARENT_OPTION, false ) ); ?>>
+						Hide the list of every review on the Reviews tab
+					</label>
+					<br><span style="color:#666;font-size:12px;">For locations with thousands of reviews, that list can freeze the browser. This replaces it with a link to the paged list below. The rating, count and Review Order buttons stay. The parent plugin still builds the list on the server, so this speeds up the browser, not the server.</span>
+				</p>
+				<p>
+					<button class="button button-primary" type="submit">Save</button>
+				</p>
+			</form>
+
 			<!-- Error email notifications -->
 			<h2 style="margin-top:24px;">Error Email Notifications</h2>
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="background:#fff;border:1px solid #c3c4c7;border-radius:4px;padding:16px 20px;margin-bottom:28px;max-width:640px;">
@@ -1505,6 +1526,43 @@ class GBRR_Location_Sync {
 				uasort( $view_reviews, function ( $a, $b ) {
 					return (int) ( $b['time'] ?? 0 ) <=> (int) ( $a['time'] ?? 0 );
 				} );
+
+				// Optional search over author, review text and ID.
+				$view_all_total = count( $view_reviews );
+				$view_search    = ( isset( $_GET['rsearch'] ) && is_string( $_GET['rsearch'] ) ) ? trim( sanitize_text_field( wp_unslash( $_GET['rsearch'] ) ) ) : '';
+				if ( '' !== $view_search ) {
+					$view_reviews = array_filter( $view_reviews, function ( $review ) use ( $view_search ) {
+						foreach ( array( $review['author_name'] ?? '', $review['text'] ?? '', $review['id'] ?? '' ) as $field ) {
+							if ( is_scalar( $field ) && '' !== (string) $field && false !== ( function_exists( 'mb_stripos' ) ? mb_stripos( (string) $field, $view_search ) : stripos( (string) $field, $view_search ) ) ) {
+								return true;
+							}
+						}
+						return false;
+					} );
+				}
+
+				// One page of the list at a time; a location can hold thousands.
+				$view_total = count( $view_reviews );
+				$view_pages = max( 1, (int) ceil( $view_total / GBRR_SYNC_REVIEWS_PER_PAGE ) );
+				$view_page  = ( isset( $_GET['rpage'] ) && is_string( $_GET['rpage'] ) && ctype_digit( $_GET['rpage'] ) ) ? max( 1, (int) $_GET['rpage'] ) : 1;
+				$view_page  = min( $view_page, $view_pages );
+				$view_first = ( $view_page - 1 ) * GBRR_SYNC_REVIEWS_PER_PAGE;
+				$view_reviews = array_slice( $view_reviews, $view_first, GBRR_SYNC_REVIEWS_PER_PAGE, true );
+				$view_pager = '';
+				if ( $view_pages > 1 ) {
+					$view_pager = '<div class="tablenav-pages" style="margin:8px 0;float:none;">'
+						. '<span style="margin-right:12px;">' . esc_html( sprintf( 'Showing %s–%s of %s', number_format( $view_first + 1 ), number_format( $view_first + count( $view_reviews ) ), number_format( $view_total ) ) ) . '</span>'
+						. paginate_links( array(
+							'base'         => $page_url . '&reviews=' . rawurlencode( $view_pid ) . ( '' !== $view_search ? '&rsearch=' . rawurlencode( $view_search ) : '' ) . '&rpage=%#%',
+							'format'       => '',
+							'current'      => $view_page,
+							'total'        => $view_pages,
+							'add_fragment' => '#gbrr-reviews',
+							'prev_text'    => '&laquo; Previous',
+							'next_text'    => 'Next &raquo;',
+						) )
+						. '</div>';
+				}
 			?>
 			<!-- Retrieved reviews for one location -->
 			<h2 id="gbrr-reviews">Retrieved Reviews: <?php echo esc_html( $view_place['name'] ?? $view_pid ); ?>
@@ -1514,10 +1572,24 @@ class GBRR_Location_Sync {
 			if ( '' !== $view_address ) : ?>
 				<p style="margin-top:-8px;color:#666;"><?php echo esc_html( $view_address ); ?></p>
 			<?php endif; ?>
-			<p class="description">The reviews stored for this location by Reviews and Rating, newest first. Hide or reorder them on the plugin's own <a href="<?php echo esc_url( admin_url( 'options-general.php?page=google_business_reviews_rating_settings' ) ); ?>">Reviews tab</a>.</p>
-			<?php if ( empty( $view_reviews ) ) : ?>
+			<p class="description">The reviews stored for this location by Reviews and Rating, newest first, <?php echo esc_html( number_format( GBRR_SYNC_REVIEWS_PER_PAGE ) ); ?> to a page, with a search box. <?php if ( get_option( GBRR_SYNC_HIDE_PARENT_OPTION, false ) ) : ?>To hide or reorder reviews, turn the Reviews tab list back on above, then use the plugin's own <?php else : ?>Hide or reorder them on the plugin's own <?php endif; ?><a href="<?php echo esc_url( admin_url( 'options-general.php?page=google_business_reviews_rating_settings' ) ); ?>">Reviews tab</a>.</p>
+			<?php if ( 0 === $view_all_total ) : ?>
 				<p>No reviews are stored for this location yet.</p>
 			<?php else : ?>
+			<form method="get" action="<?php echo esc_url( admin_url( 'options-general.php' ) . '#gbrr-reviews' ); ?>" style="margin:12px 0;">
+				<input type="hidden" name="page" value="gbrr-location-sync">
+				<input type="hidden" name="reviews" value="<?php echo esc_attr( $view_pid ); ?>">
+				<input type="search" name="rsearch" value="<?php echo esc_attr( $view_search ); ?>" class="regular-text" placeholder="Search author, review text or ID" aria-label="Search reviews">
+				<button class="button" type="submit">Search</button>
+				<?php if ( '' !== $view_search ) : ?>
+					<a class="button-link" style="margin-left:8px;" href="<?php echo esc_url( add_query_arg( 'reviews', rawurlencode( $view_pid ), $page_url ) . '#gbrr-reviews' ); ?>">Clear search</a>
+					<span style="margin-left:8px;color:#666;"><?php echo esc_html( sprintf( '%s of %s reviews match', number_format( $view_total ), number_format( $view_all_total ) ) ); ?></span>
+				<?php endif; ?>
+			</form>
+			<?php if ( 0 === $view_total ) : ?>
+				<p>No reviews match your search.</p>
+			<?php else : ?>
+			<?php echo $view_pager; // Built from escaped parts and paginate_links(). ?>
 			<table class="widefat striped" style="margin-bottom:28px;">
 				<thead>
 					<tr>
@@ -1557,6 +1629,8 @@ class GBRR_Location_Sync {
 					<?php endforeach; ?>
 				</tbody>
 			</table>
+			<?php echo $view_pager; // Built from escaped parts and paginate_links(). ?>
+			<?php endif; ?>
 			<?php endif; ?>
 			<?php endif; ?>
 
@@ -1722,6 +1796,84 @@ class GBRR_Location_Sync {
 		$this->set_flash( $result['message'], $result['ok'] ? 'success' : 'error' );
 
 		wp_safe_redirect( admin_url( 'options-general.php?page=gbrr-location-sync' ) . '#gbrr-backups' );
+		exit;
+	}
+
+	/**
+	 * Starts buffering the parent plugin's settings page when its Reviews tab
+	 * list is switched off, so the list can be cut out of the output.
+	 */
+	public function maybe_hide_parent_reviews() {
+		if ( ! get_option( GBRR_SYNC_HIDE_PARENT_OPTION, false ) ) {
+			return;
+		}
+		if ( defined( 'DOING_AJAX' ) && DOING_AJAX ) {
+			return;
+		}
+		$page = ( isset( $_GET['page'] ) && is_string( $_GET['page'] ) ) ? sanitize_key( wp_unslash( $_GET['page'] ) ) : '';
+		if ( ! preg_match( '/^google_business_reviews_rating(?:_settings)?$/', $page ) ) {
+			return;
+		}
+		ob_start( array( $this, 'hide_parent_reviews_list' ) );
+	}
+
+	/**
+	 * Output-buffer callback: swaps the parent's list of every review (the
+	 * .reviews-table block on its Reviews tab) for a short note. The parent
+	 * builds the list in PHP regardless; this keeps the browser from having to
+	 * load thousands of rows. Returns the page untouched if the markup isn't
+	 * what it expects.
+	 */
+	public function hide_parent_reviews_list( $html ) {
+		if ( ! is_string( $html ) ) {
+			return $html;
+		}
+		$open  = '<div class="reviews-table">';
+		$start = strpos( $html, $open );
+		if ( false === $start ) {
+			return $html;
+		}
+
+		// The list is followed by the review-order dialog, a footnote or the
+		// end of the tab, whichever the parent prints. Review text is escaped,
+		// so none of these can appear inside the list itself.
+		$end = false;
+		foreach ( array( '<dialog id="review-order-dialog"', '<p class="note help">', '</section>' ) as $marker ) {
+			$at = strpos( $html, $marker, $start );
+			if ( false !== $at && ( false === $end || $at < $end ) ) {
+				$end = $at;
+			}
+		}
+		if ( false === $end ) {
+			return $html;
+		}
+		$close = strrpos( substr( $html, 0, $end ), '</div>' );
+		if ( false === $close || $close < $start ) {
+			return $html;
+		}
+
+		$link = add_query_arg(
+			'reviews',
+			rawurlencode( (string) get_option( GBRR_SYNC_OPTION_BASE . '_place_id', '' ) ),
+			admin_url( 'options-general.php?page=gbrr-location-sync' )
+		) . '#gbrr-reviews';
+		$note = '<div class="reviews-table"><p class="description">The list of reviews is turned off here by GBRR Location Sync, because it is slow to load. '
+			. '<a href="' . esc_url( $link ) . '">Browse the retrieved reviews in Settings &rarr; GBRR Sync</a>, which shows them a page at a time.</p></div>';
+
+		return substr( $html, 0, $start ) . $note . substr( $html, $close + strlen( '</div>' ) );
+	}
+
+	public function handle_save_display() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Access denied.' );
+		}
+		check_admin_referer( 'gbrr_save_display', 'gbrr_display_nonce' );
+
+		$hide = ! empty( $_POST['gbrr_hide_parent_reviews'] );
+		update_option( GBRR_SYNC_HIDE_PARENT_OPTION, $hide ? '1' : '', 'yes' );
+		$this->set_flash( $hide ? 'The list of reviews on the Reviews and Rating Reviews tab is now hidden.' : 'The list of reviews on the Reviews and Rating Reviews tab is shown again.' );
+
+		wp_safe_redirect( admin_url( 'options-general.php?page=gbrr-location-sync' ) );
 		exit;
 	}
 

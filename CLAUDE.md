@@ -64,9 +64,18 @@ Project notes for Claude Code working in this repo.
   idempotent. It backfills missing keys (skipping rows that already have a `checked` key)
   and, on parent 6.x, removes rows that duplicate a `<place_id>_<author id>` row under
   another key (left by versions before 1.4.0), keeping the parent's row.
+- The retrieved-reviews list on our page is paged (`GBRR_SYNC_REVIEWS_PER_PAGE`, `?rpage=`) and
+  searchable (`?rsearch=`, server-side over author, text and ID); keep both when changing it, since
+  one location can hold thousands of reviews.
+- Optional `gbrr_location_sync_hide_parent_reviews`: `maybe_hide_parent_reviews()` buffers the parent's
+  settings page (`page=google_business_reviews_rating[_settings]`) and `hide_parent_reviews_list()`
+  swaps its `.reviews-table` block for a note, ending at the next `<dialog id="review-order-dialog"`,
+  `<p class="note help">` or `</section>`. If the parent's markup changes it must leave the page
+  untouched. The parent still builds the list server-side; this only spares the browser.
 - Plugin-owned options: `gbrr_location_sync_log`, `gbrr_sync_db_version`,
   `gbrr_location_sync_notify_enabled`, `gbrr_location_sync_notify_email`,
-  `gbrr_location_sync_backups`, `gbrr_location_sync_reviews_known`.
+  `gbrr_location_sync_backups`, `gbrr_location_sync_reviews_known`,
+  `gbrr_location_sync_hide_parent_reviews`.
   Admin page: **Settings → GBRR Sync** (`options-general.php?page=gbrr-location-sync`).
 - Never log or display the API key; route error text through `redact_key()`.
 
