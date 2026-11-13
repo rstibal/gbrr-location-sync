@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.5.2
+ * Version:     1.6.0
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,13 +15,16 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.5.2' );
+define( 'GBRR_SYNC_VERSION',     '1.6.0' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
 define( 'GBRR_SYNC_DB_OPTION',   'gbrr_sync_db_version' );
 define( 'GBRR_SYNC_NOTIFY_ENABLED_OPTION', 'gbrr_location_sync_notify_enabled' );
 define( 'GBRR_SYNC_NOTIFY_EMAIL_OPTION',   'gbrr_location_sync_notify_email' );
+define( 'GBRR_SYNC_BACKUPS_OPTION',        'gbrr_location_sync_backups' );
+define( 'GBRR_SYNC_KNOWN_COUNT_OPTION',    'gbrr_location_sync_reviews_known' );
+define( 'GBRR_SYNC_BACKUPS_KEEP',          7 );
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -59,7 +62,14 @@ class GBRR_Location_Sync {
 		add_action( 'admin_post_gbrr_conn_test',   array( $this, 'handle_conn_test' ) );
 		add_action( 'admin_post_gbrr_save_notify', array( $this, 'handle_save_notify' ) );
 		add_action( 'admin_init',                  array( $this, 'maybe_repair_reviews' ) );
+		add_action( 'admin_post_gbrr_backup_now',  array( $this, 'handle_backup_now' ) );
+		add_action( 'admin_post_gbrr_restore_backup', array( $this, 'handle_restore_backup' ) );
+		// Checks every save of the review store, the parent plugin's included.
+		add_filter( 'pre_update_option_' . GBRR_SYNC_OPTION_BASE . '_reviews', array( $this, 'guard_reviews_save' ), 10, 2 );
 	}
+
+	/** True while restore_backup() saves, which only ever adds reviews. */
+	private $guard_off = false;
 
 	// -----------------------------------------------------------------------
 	// Activation / deactivation
@@ -89,6 +99,9 @@ class GBRR_Location_Sync {
 	 * the run was skipped (no API key or no saved locations).
 	 */
 	public function run_sync() {
+		// Daily copy of the review store, taken before anything is written.
+		$this->maybe_backup_reviews();
+
 		$api_key = get_option( GBRR_SYNC_OPTION_BASE . '_api_key' );
 		$places  = get_option( GBRR_SYNC_OPTION_BASE . '_places', array() );
 
@@ -305,24 +318,8 @@ class GBRR_Location_Sync {
 			if ( isset( $store['error'] ) ) {
 				$reviews_error = $store['error'];
 			} else {
-				$reviews_all = $this->merge_reviews( $store['reviews'], $new_reviews, $pid );
-				update_option( GBRR_SYNC_OPTION_BASE . '_reviews', $reviews_all, 'no' );
-
-				// Large stores can save in a form that doesn't read back
-				// (the parent's own import checks for this too). If ours
-				// didn't, put the previous bytes back.
-				$check = $this->read_stored_reviews();
-				if ( isset( $check['error'] ) ) {
-					if ( null !== $store['raw'] ) {
-						global $wpdb;
-						$wpdb->update( $wpdb->options, array( 'option_value' => $store['raw'] ), array( 'option_name' => GBRR_SYNC_OPTION_BASE . '_reviews' ) );
-					}
-					wp_cache_delete( GBRR_SYNC_OPTION_BASE . '_reviews', 'options' );
-					$reviews_error = 'the saved reviews did not read back (' . $check['error'] . '), so the previous copy was put back';
-				}
-				wp_cache_delete( 'reviews',          GBRR_SYNC_OPTION_BASE );
-				wp_cache_delete( 'reviews_shuffled', GBRR_SYNC_OPTION_BASE );
-				delete_transient( GBRR_SYNC_OPTION_BASE . '_reviews_shuffled' );
+				$reviews_all   = $this->merge_reviews( $store['reviews'], $new_reviews, $pid );
+				$reviews_error = $this->save_reviews_store( $reviews_all, $store['raw'] );
 			}
 		}
 
@@ -369,6 +366,337 @@ class GBRR_Location_Sync {
 			return array( 'reviews' => array(), 'raw' => $raw );
 		}
 		return array( 'error' => sprintf( 'the stored reviews (%s bytes) could not be read', number_format( strlen( $raw ) ) ) );
+	}
+
+	/**
+	 * Saves the whole review store and checks it reads back. Large stores
+	 * can save in a form that doesn't read back (the parent's own import
+	 * checks for this too); if so, the previous bytes are put back.
+	 * Returns null on success or an error string.
+	 */
+	private function save_reviews_store( $reviews, $previous_raw ) {
+		update_option( GBRR_SYNC_OPTION_BASE . '_reviews', $reviews, 'no' );
+		$check = $this->read_stored_reviews();
+		if ( isset( $check['error'] ) ) {
+			if ( null !== $previous_raw ) {
+				global $wpdb;
+				$wpdb->update( $wpdb->options, array( 'option_value' => $previous_raw ), array( 'option_name' => GBRR_SYNC_OPTION_BASE . '_reviews' ) );
+			}
+			wp_cache_delete( GBRR_SYNC_OPTION_BASE . '_reviews', 'options' );
+			return 'the saved reviews did not read back (' . $check['error'] . '), so the previous copy was put back';
+		}
+		wp_cache_delete( 'reviews',          GBRR_SYNC_OPTION_BASE );
+		wp_cache_delete( 'reviews_shuffled', GBRR_SYNC_OPTION_BASE );
+		delete_transient( GBRR_SYNC_OPTION_BASE . '_reviews_shuffled' );
+		return null;
+	}
+
+	/** Number of review rows per place ID. */
+	private function count_by_place( $reviews ) {
+		$counts = array();
+		foreach ( $reviews as $row ) {
+			if ( is_array( $row ) && isset( $row['place_id'] ) && is_string( $row['place_id'] ) ) {
+				$counts[ $row['place_id'] ] = ( $counts[ $row['place_id'] ] ?? 0 ) + 1;
+			}
+		}
+		return $counts;
+	}
+
+	/** Place IDs of the saved locations. */
+	private function saved_place_ids() {
+		$places = $this->fresh_option( GBRR_SYNC_OPTION_BASE . '_places', array() );
+		$ids    = array();
+		foreach ( is_array( $places ) ? $places : array() as $place ) {
+			if ( is_array( $place ) && isset( $place['place_id'] ) && is_string( $place['place_id'] ) ) {
+				$ids[] = $place['place_id'];
+			}
+		}
+		return $ids;
+	}
+
+	// -----------------------------------------------------------------------
+	// Save guard for the review store
+	// -----------------------------------------------------------------------
+
+	/**
+	 * pre_update_option filter on the parent's review store. Runs for every
+	 * plugin's save, the parent's hourly refresh included. Returning
+	 * $old_value makes WordPress skip the save.
+	 *
+	 * Blocks a save when the stored reviews can't be read and the new value
+	 * is much smaller than the last known store, or when it would remove
+	 * more than 5 reviews from saved locations. Removing every review of
+	 * one non-active location is allowed: that's how the parent deletes a
+	 * location (it saves the reviews before it removes the location).
+	 */
+	public function guard_reviews_save( $value, $old_value ) {
+		if ( $this->guard_off ) {
+			return $value;
+		}
+		$new   = is_array( $value ) ? $value : array();
+		$store = $this->read_stored_reviews();
+
+		if ( isset( $store['error'] ) ) {
+			$known = (int) get_option( GBRR_SYNC_KNOWN_COUNT_OPTION, 0 );
+			if ( count( $new ) + 5 >= $known ) {
+				return $value; // e.g. the parent putting back its own copy after a failed import.
+			}
+			return $this->block_reviews_save( sprintf(
+				"the stored reviews can't be read right now (%s), and the new value has only %s of the %s reviews last known to be stored",
+				$store['error'],
+				number_format( count( $new ) ),
+				number_format( $known )
+			), $old_value );
+		}
+
+		$stored = $store['reviews'];
+		if ( empty( $stored ) ) {
+			$this->remember_review_count( count( $new ) );
+			return $value;
+		}
+
+		$before = $this->count_by_place( $stored );
+		$after  = $this->count_by_place( $new );
+		$lost   = array();
+		foreach ( $this->saved_place_ids() as $pid ) {
+			$drop = ( $before[ $pid ] ?? 0 ) - ( $after[ $pid ] ?? 0 );
+			if ( $drop > 0 ) {
+				$lost[ $pid ] = $drop;
+			}
+		}
+		$total = array_sum( $lost );
+
+		$allowed = ( $total <= 5 );
+		if ( ! $allowed && 1 === count( $lost ) ) {
+			$pid     = key( $lost );
+			$allowed = ( $pid !== $this->fresh_option( GBRR_SYNC_OPTION_BASE . '_place_id' ) && 0 === ( $after[ $pid ] ?? 0 ) );
+		}
+		if ( $allowed ) {
+			$this->remember_review_count( count( $new ) );
+			return $value;
+		}
+
+		$parts = array();
+		foreach ( $lost as $pid => $drop ) {
+			$parts[] = sprintf( '%s: %s of %s', $pid, number_format( $drop ), number_format( $before[ $pid ] ) );
+		}
+		return $this->block_reviews_save( sprintf(
+			'it would remove %s stored review(s) from %d saved location(s) (%s)',
+			number_format( $total ),
+			count( $lost ),
+			implode( '; ', $parts )
+		), $old_value );
+	}
+
+	/** Logs a blocked save (once an hour per message) and emails (once every 6 hours). */
+	private function block_reviews_save( $reason, $old_value ) {
+		$message = 'Blocked a save of the review store: ' . $reason . '. The stored reviews were left as they were.';
+		$log_key = 'gbrr_guard_' . md5( $message );
+		if ( ! get_transient( $log_key ) ) {
+			set_transient( $log_key, 1, HOUR_IN_SECONDS );
+			$this->log( 'guard', $message );
+		}
+		$to = $this->get_notify_recipients();
+		if ( ! empty( $to ) && ! get_transient( 'gbrr_guard_mailed' ) ) {
+			set_transient( 'gbrr_guard_mailed', 1, 6 * HOUR_IN_SECONDS );
+			wp_mail(
+				$to,
+				sprintf( '[%s] GBRR Location Sync: blocked a save that would have lost reviews', get_bloginfo( 'name' ) ),
+				sprintf(
+					"GBRR Location Sync stopped a save of the Reviews and Rating review store on %s:\n\n%s\n\nNothing was lost. If a plugin keeps trying, it's blocked again each time; further emails are held for 6 hours. See Settings \xE2\x86\x92 GBRR Sync on %s for the log and the review backups.",
+					gmdate( 'Y-m-d H:i:s' ) . ' UTC',
+					$message,
+					home_url()
+				)
+			);
+		}
+		return $old_value;
+	}
+
+	private function remember_review_count( $count ) {
+		if ( (int) get_option( GBRR_SYNC_KNOWN_COUNT_OPTION, 0 ) !== $count ) {
+			update_option( GBRR_SYNC_KNOWN_COUNT_OPTION, $count, 'no' );
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Review backups
+	// -----------------------------------------------------------------------
+
+	/** The backup folder in uploads, created with web access blocked, or null. */
+	private function backup_dir() {
+		$uploads = wp_upload_dir();
+		if ( ! empty( $uploads['error'] ) || empty( $uploads['basedir'] ) ) {
+			return null;
+		}
+		$dir = rtrim( $uploads['basedir'], '/\\' ) . '/gbrr-location-sync';
+		if ( ! wp_mkdir_p( $dir ) ) {
+			return null;
+		}
+		if ( ! is_file( $dir . '/index.php' ) ) {
+			@file_put_contents( $dir . '/index.php', "<?php\n// Silence is golden.\n" );
+		}
+		if ( ! is_file( $dir . '/.htaccess' ) ) {
+			@file_put_contents( $dir . '/.htaccess', "Require all denied\nDeny from all\n" );
+		}
+		return $dir;
+	}
+
+	/** The backup list, newest first. */
+	private function get_backups() {
+		$index = get_option( GBRR_SYNC_BACKUPS_OPTION, array() );
+		return is_array( $index ) ? array_values( array_filter( $index, 'is_array' ) ) : array();
+	}
+
+	/**
+	 * Saves a gzipped copy of the stored review bytes, at most once every
+	 * 20 hours unless $force. Never backs up a store it can't read, or an
+	 * empty one. Keeps the newest GBRR_SYNC_BACKUPS_KEEP plus the one with
+	 * the most reviews. Returns the new entry, an error string, or null
+	 * when there was nothing to do.
+	 */
+	public function maybe_backup_reviews( $force = false, $now = null ) {
+		$now   = ( null === $now ) ? time() : (int) $now;
+		$index = $this->get_backups();
+		if ( ! $force && ! empty( $index ) && $now - (int) ( $index[0]['time'] ?? 0 ) < 20 * HOUR_IN_SECONDS ) {
+			return null;
+		}
+
+		$store = $this->read_stored_reviews();
+		if ( isset( $store['error'] ) ) {
+			$error = 'Backup skipped: ' . $store['error'] . '.';
+			$this->log( 'error', $error );
+			return $error;
+		}
+		if ( empty( $store['reviews'] ) || null === $store['raw'] ) {
+			return null;
+		}
+		$this->remember_review_count( count( $store['reviews'] ) );
+
+		$dir  = $this->backup_dir();
+		$gz   = function_exists( 'gzencode' ) ? gzencode( $store['raw'], 6 ) : false;
+		$file = 'reviews-' . gmdate( 'Ymd-His', $now ) . '-' . wp_generate_password( 16, false ) . '.gz';
+		if ( null === $dir || false === $gz || false === @file_put_contents( $dir . '/' . $file, $gz ) ) {
+			$error = 'Backup failed: could not write to wp-content/uploads/gbrr-location-sync.';
+			$this->log( 'error', $error );
+			return $error;
+		}
+
+		$entry = array(
+			'file'   => $file,
+			'time'   => $now,
+			'count'  => count( $store['reviews'] ),
+			'places' => $this->count_by_place( $store['reviews'] ),
+			'bytes'  => strlen( $store['raw'] ),
+		);
+		$index[] = $entry;
+		usort( $index, function ( $a, $b ) { return (int) $b['time'] <=> (int) $a['time']; } );
+
+		$keep    = array_slice( $index, 0, GBRR_SYNC_BACKUPS_KEEP );
+		$largest = null;
+		foreach ( $index as $e ) {
+			if ( null === $largest || (int) $e['count'] > (int) $largest['count'] ) {
+				$largest = $e;
+			}
+		}
+		if ( $largest && ! in_array( $largest['file'], array_column( $keep, 'file' ), true ) ) {
+			$keep[] = $largest;
+		}
+		foreach ( $index as $e ) {
+			if ( ! in_array( $e['file'], array_column( $keep, 'file' ), true ) ) {
+				@unlink( $dir . '/' . basename( $e['file'] ) );
+			}
+		}
+		update_option( GBRR_SYNC_BACKUPS_OPTION, $keep, 'no' );
+
+		$this->log( 'backup', sprintf( 'Backed up %s stored review(s) (%s KB).', number_format( $entry['count'] ), number_format( $entry['bytes'] / 1024 ) ) );
+		return $entry;
+	}
+
+	/**
+	 * Adds back the reviews in a backup that are missing from the store.
+	 * Never removes or changes a stored review, and skips reviews of
+	 * locations that are no longer saved. A restored review whose ID is
+	 * taken gets a new one. Works when the store can't be read at all.
+	 */
+	public function restore_backup( $file ) {
+		$entry = null;
+		foreach ( $this->get_backups() as $e ) {
+			if ( ( $e['file'] ?? null ) === $file ) {
+				$entry = $e;
+				break;
+			}
+		}
+		$dir = $this->backup_dir();
+		if ( null === $entry || null === $dir || ! is_file( $dir . '/' . basename( $file ) ) ) {
+			return array( 'ok' => false, 'message' => 'That backup was not found.' );
+		}
+		$raw    = @file_get_contents( $dir . '/' . basename( $file ) );
+		$raw    = ( false !== $raw && function_exists( 'gzdecode' ) ) ? @gzdecode( $raw ) : false;
+		$backup = ( false !== $raw ) ? maybe_unserialize( $raw ) : false;
+		if ( ! is_array( $backup ) ) {
+			return array( 'ok' => false, 'message' => 'That backup could not be read.' );
+		}
+
+		$store = $this->read_stored_reviews();
+		if ( isset( $store['error'] ) ) {
+			$reviews      = array(); // Unreadable: nothing in it can be kept anyway.
+			$previous_raw = null;
+		} else {
+			$reviews      = $store['reviews'];
+			$previous_raw = $store['raw'];
+			if ( ! empty( $reviews ) ) {
+				$this->maybe_backup_reviews( true ); // So this restore can be undone.
+			}
+		}
+
+		$places = $this->saved_place_ids();
+		$used   = array();
+		$max_id = 0;
+		foreach ( $reviews as $row ) {
+			if ( is_array( $row ) && isset( $row['id'] ) && is_numeric( $row['id'] ) ) {
+				$used[ (int) $row['id'] ] = true;
+				$max_id = max( $max_id, (int) $row['id'] );
+			}
+		}
+
+		$added = 0;
+		foreach ( $backup as $key => $row ) {
+			$pid = is_array( $row ) ? ( $row['place_id'] ?? null ) : null;
+			if ( ! is_string( $pid ) || ! in_array( $pid, $places, true ) || isset( $reviews[ $key ] ) ) {
+				continue;
+			}
+			if ( isset( $row['author_id'] ) && isset( $reviews[ $pid . '_' . $row['author_id'] ] ) ) {
+				continue; // Same review, stored under the parent's newer key.
+			}
+			$id = ( isset( $row['id'] ) && is_numeric( $row['id'] ) ) ? (int) $row['id'] : 0;
+			if ( $id < 1 || isset( $used[ $id ] ) ) {
+				$id = $max_id + 1;
+			}
+			$row['id']       = $id;
+			$used[ $id ]     = true;
+			$max_id          = max( $max_id, $id );
+			$reviews[ $key ] = $row;
+			$added++;
+		}
+
+		$when = gmdate( 'Y-m-d H:i', (int) $entry['time'] ) . ' UTC';
+		if ( 0 === $added && ! isset( $store['error'] ) ) {
+			return array( 'ok' => true, 'added' => 0, 'message' => sprintf( 'Nothing to restore: every review in the backup from %s is already stored.', $when ) );
+		}
+
+		$this->guard_off = true;
+		$error           = $this->save_reviews_store( $reviews, $previous_raw );
+		$this->guard_off = false;
+		if ( null !== $error ) {
+			$this->log( 'error', 'Restore failed: ' . $error . '.' );
+			return array( 'ok' => false, 'message' => 'Restore failed: ' . $error . '.' );
+		}
+		$this->remember_review_count( count( $reviews ) );
+
+		$message = sprintf( 'Restored %s review(s) from the backup of %s. The store now has %s.', number_format( $added ), $when, number_format( count( $reviews ) ) );
+		$this->log( 'restore', $message );
+		return array( 'ok' => true, 'added' => $added, 'message' => $message );
 	}
 
 	/**
@@ -546,15 +874,19 @@ class GBRR_Location_Sync {
 				}
 			}
 
-			if ( $duplicates > 0 ) {
-				$this->log( 'repair', sprintf( 'v%s repair: removed %d duplicate review row(s).', GBRR_SYNC_VERSION, $duplicates ) );
-			}
-
 			if ( $repaired > 0 || $duplicates > 0 ) {
-				update_option( GBRR_SYNC_OPTION_BASE . '_reviews', $reviews, 'no' );
-				wp_cache_delete( 'reviews',          GBRR_SYNC_OPTION_BASE );
-				wp_cache_delete( 'reviews_shuffled', GBRR_SYNC_OPTION_BASE );
-				delete_transient( GBRR_SYNC_OPTION_BASE . '_reviews_shuffled' );
+				// Removing duplicates can drop many rows from one location,
+				// which the save guard would block; they all exist twice.
+				$this->guard_off = true;
+				$save_error      = $this->save_reviews_store( $reviews, $store['raw'] );
+				$this->guard_off = false;
+				if ( null !== $save_error ) {
+					$this->log( 'error', sprintf( 'v%s repair not saved: %s.', GBRR_SYNC_VERSION, $save_error ) );
+					return; // Retried on a later admin page load.
+				}
+				if ( $duplicates > 0 ) {
+					$this->log( 'repair', sprintf( 'v%s repair: removed %d duplicate review row(s).', GBRR_SYNC_VERSION, $duplicates ) );
+				}
 				if ( $repaired > 0 ) {
 					$this->log( 'repair', sprintf( 'v%s repair: backfilled native row keys on %d legacy review(s).', GBRR_SYNC_VERSION, $repaired ) );
 				}
@@ -1228,6 +1560,61 @@ class GBRR_Location_Sync {
 			<?php endif; ?>
 			<?php endif; ?>
 
+			<!-- Review backups -->
+			<?php
+			$backups        = $this->get_backups();
+			$largest_backup = null;
+			foreach ( $backups as $b ) {
+				if ( null === $largest_backup || (int) $b['count'] > (int) $largest_backup['count'] ) {
+					$largest_backup = $b;
+				}
+			}
+			$stored_count = count( $reviews );
+			?>
+			<h2 id="gbrr-backups">Review Backups</h2>
+			<p class="description" style="max-width:780px;">A copy of the stored reviews is saved once a day, before the daily sync, in <code>wp-content/uploads/gbrr-location-sync/</code>. The <?php echo esc_html( GBRR_SYNC_BACKUPS_KEEP ); ?> newest are kept, plus the one with the most reviews. Restoring adds back the reviews a backup has that are missing now; it never removes or changes a stored review, and skips locations that are no longer saved.</p>
+			<?php if ( $largest_backup && $stored_count + 5 < (int) $largest_backup['count'] ) : ?>
+				<div class="notice notice-warning inline"><p><strong>Fewer reviews are stored than in a backup.</strong> <?php echo esc_html( sprintf( 'The store has %s reviews; the backup from %s UTC has %s. If reviews went missing, restore that backup below.', number_format( $stored_count ), gmdate( 'Y-m-d H:i', (int) $largest_backup['time'] ), number_format( (int) $largest_backup['count'] ) ) ); ?></p></div>
+			<?php endif; ?>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin:12px 0;">
+				<?php wp_nonce_field( 'gbrr_backup_now', 'gbrr_backup_nonce' ); ?>
+				<input type="hidden" name="action" value="gbrr_backup_now">
+				<button class="button" type="submit">Back Up Reviews Now</button>
+			</form>
+			<?php if ( empty( $backups ) ) : ?>
+				<p>No backups yet. The first one is made at the next daily sync, or use the button above.</p>
+			<?php else : ?>
+			<table class="widefat striped" style="margin-bottom:28px;max-width:780px;">
+				<thead>
+					<tr>
+						<th>Backed up (UTC)</th>
+						<th>Reviews</th>
+						<th>Size</th>
+						<th></th>
+					</tr>
+				</thead>
+				<tbody>
+					<?php foreach ( $backups as $b ) :
+						$is_largest = ( $largest_backup && $b['file'] === $largest_backup['file'] );
+					?>
+					<tr>
+						<td><?php echo esc_html( gmdate( 'Y-m-d H:i', (int) $b['time'] ) ); ?><?php echo $is_largest ? ' <span style="color:#666;">(most reviews)</span>' : ''; ?></td>
+						<td><?php echo esc_html( number_format( (int) $b['count'] ) ); ?></td>
+						<td><?php echo esc_html( number_format( (int) ( $b['bytes'] ?? 0 ) / 1024 ) . ' KB' ); ?></td>
+						<td>
+							<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" onsubmit="return confirm('Add back the reviews from this backup that are missing now? Stored reviews are not removed or changed.');">
+								<?php wp_nonce_field( 'gbrr_restore_backup', 'gbrr_restore_nonce' ); ?>
+								<input type="hidden" name="action" value="gbrr_restore_backup">
+								<input type="hidden" name="gbrr_backup_file" value="<?php echo esc_attr( $b['file'] ); ?>">
+								<button class="button" type="submit">Restore Missing Reviews</button>
+							</form>
+						</td>
+					</tr>
+					<?php endforeach; ?>
+				</tbody>
+			</table>
+			<?php endif; ?>
+
 			<!-- Log -->
 			<h2>Sync Log <small style="font-weight:normal;font-size:13px;">(most recent 50 entries)</small></h2>
 			<?php
@@ -1253,6 +1640,9 @@ class GBRR_Location_Sync {
 						'manual'   => '#0073aa',
 						'conntest' => '#8B5CF6',
 						'repair'   => '#8B5CF6',
+						'guard'    => '#d63638',
+						'backup'   => '#0073aa',
+						'restore'  => '#8B5CF6',
 					);
 					foreach ( $tail as $entry ) :
 						$color = $colors[ $entry['type'] ] ?? '#555';
@@ -1299,6 +1689,39 @@ class GBRR_Location_Sync {
 		}
 
 		wp_safe_redirect( admin_url( 'options-general.php?page=gbrr-location-sync' ) );
+		exit;
+	}
+
+	public function handle_backup_now() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Access denied.' );
+		}
+		check_admin_referer( 'gbrr_backup_now', 'gbrr_backup_nonce' );
+
+		$result = $this->maybe_backup_reviews( true );
+		if ( is_array( $result ) ) {
+			$this->set_flash( sprintf( 'Backed up %s stored review(s).', number_format( $result['count'] ) ) );
+		} elseif ( is_string( $result ) ) {
+			$this->set_flash( $result, 'error' );
+		} else {
+			$this->set_flash( 'There are no stored reviews to back up.', 'warning' );
+		}
+
+		wp_safe_redirect( admin_url( 'options-general.php?page=gbrr-location-sync' ) . '#gbrr-backups' );
+		exit;
+	}
+
+	public function handle_restore_backup() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Access denied.' );
+		}
+		check_admin_referer( 'gbrr_restore_backup', 'gbrr_restore_nonce' );
+
+		$file   = ( isset( $_POST['gbrr_backup_file'] ) && is_string( $_POST['gbrr_backup_file'] ) ) ? sanitize_file_name( wp_unslash( $_POST['gbrr_backup_file'] ) ) : '';
+		$result = $this->restore_backup( $file );
+		$this->set_flash( $result['message'], $result['ok'] ? 'success' : 'error' );
+
+		wp_safe_redirect( admin_url( 'options-general.php?page=gbrr-location-sync' ) . '#gbrr-backups' );
 		exit;
 	}
 

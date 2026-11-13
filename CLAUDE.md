@@ -44,13 +44,29 @@ Project notes for Claude Code working in this repo.
   unserialize); treating an unreadable store as empty and saving erased about 3,800
   imported reviews on injurylawyers.com in Nov 2026 (the store was ~4–5 MB). Refuse to
   write on a read error, re-read after writing, and put the previous bytes back if the
-  new value doesn't read back. The parent's own writes don't have this check.
+  new value doesn't read back.
+- `guard_reviews_save()` is a `pre_update_option_google_business_reviews_rating_reviews`
+  filter, so it checks every plugin's save of the store, the parent's included; returning
+  `$old_value` makes WordPress skip the save. It blocks a save that removes more than 5
+  reviews from saved locations, except all reviews of one non-active location (the
+  parent's `delete_place()` saves the reviews *before* removing the location), and a
+  save over an unreadable store unless it keeps about the last known count
+  (`gbrr_location_sync_reviews_known`; lets the parent's failed-import rollback through).
+  Our own saves that remove rows on purpose (the repair's dedupe, `restore_backup()`)
+  set `$this->guard_off`.
+- Daily backups (`maybe_backup_reviews()`, run at the start of `run_sync()`) are gzipped
+  copies of the raw stored bytes in `wp-content/uploads/gbrr-location-sync/` (random file
+  names, `.htaccess` + `index.php`), listed in `gbrr_location_sync_backups`. The newest 7
+  are kept plus the one with the most reviews, so a slow loss can't age every good copy
+  out. `restore_backup()` only adds missing reviews (never removes or changes one), skips
+  locations no longer saved, gives colliding IDs new ones, and backs up the store first.
 - `maybe_repair_reviews()` re-runs whenever `GBRR_SYNC_VERSION` changes; it must stay
   idempotent. It backfills missing keys (skipping rows that already have a `checked` key)
   and, on parent 6.x, removes rows that duplicate a `<place_id>_<author id>` row under
   another key (left by versions before 1.4.0), keeping the parent's row.
 - Plugin-owned options: `gbrr_location_sync_log`, `gbrr_sync_db_version`,
-  `gbrr_location_sync_notify_enabled`, `gbrr_location_sync_notify_email`.
+  `gbrr_location_sync_notify_enabled`, `gbrr_location_sync_notify_email`,
+  `gbrr_location_sync_backups`, `gbrr_location_sync_reviews_known`.
   Admin page: **Settings → GBRR Sync** (`options-general.php?page=gbrr-location-sync`).
 - Never log or display the API key; route error text through `redact_key()`.
 

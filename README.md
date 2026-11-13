@@ -14,7 +14,10 @@ A small WordPress helper plugin for [Reviews and Rating – Google Reviews](http
   - How many reviews are stored for each location, linked to a list of those reviews (ID, date, rating, author, text, and whether each is shown or hidden)
   - A manual "Sync All Locations Now" action
   - A Google Places API connection/key test
+  - Review backups, with a "Restore Missing Reviews" button for each and a warning when fewer reviews are stored than in a backup
   - A rolling sync log (last 500 entries, most recent 50 shown)
+- Protects the review store. Every save of it, by this plugin or by Reviews and Rating itself, is checked first. A save that would remove more than 5 reviews from saved locations is blocked, logged and emailed. So is a save over a store that can't be read. Deleting a location along with its reviews still works.
+- Backs up the stored reviews once a day to `wp-content/uploads/gbrr-location-sync/`, keeping the 7 newest plus the one with the most reviews. Restoring only adds back reviews that are missing; it never removes or changes stored ones.
 - One-time repair routine that backfills missing keys on legacy review rows after upgrading.
 - Optional error email notifications: enable in **Settings → GBRR Sync** and enter one or more addresses (comma-separated) to get a single summary email whenever a sync run has one or more failed locations. Leave the address field blank to use the site's admin email.
 
