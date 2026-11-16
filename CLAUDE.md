@@ -54,6 +54,25 @@ Project notes for Claude Code working in this repo.
   (`gbrr_location_sync_reviews_known`; lets the parent's failed-import rollback through).
   Our own saves that remove rows on purpose (the repair's dedupe, `restore_backup()`)
   set `$this->guard_off`.
+- The guard only sees saves made after it is hooked. The parent's `dashboard/index.php` ends
+  with `new google_business_reviews_rating_dashboard()`, whose constructor runs `setup()` →
+  `set_data()` → `set_reviews()` and saves the store **while the parent's file is included**,
+  on every `is_admin()` request (wp-admin, admin-ajax.php, admin-post.php, any visitor).
+  WordPress includes plugins in `active_plugins` order, alphabetical after any activation, so
+  the parent came first, and until 1.7.1 the guard was hooked on `init`. On 2026-11-14 that
+  path replaced 8,329 reviews on injurylawyers.com with the 5 just fetched: no guard log
+  entry, row IDs restarted at 1. So the instance is created at file load (not on `init`),
+  `load_first()` (`pre_update_option_active_plugins`) and `ensure_loads_first()` keep this
+  plugin first in `active_plugins`, and anything the guard does must work before
+  `plugins_loaded` (`wp_mail()` isn't defined yet; the email is deferred). Not handled: a
+  network-activated parent on multisite always loads before a site-activated plugin.
+- `serve_stored_reviews()` is a `default_option_…_reviews` filter. It runs when `get_option()`
+  falls back to the caller's default; if the rows are in the database it returns them and
+  takes the store out of the `notoptions` cache. It must return the plain default when
+  `$passed_default` is false: `update_option()` calls the filter that way to tell a missing
+  option from a stored one. Why the store read as missing on 2026-11-14 was not established
+  (no server logs); a "reported the review store as missing" log entry is the evidence to
+  look for next time.
 - Daily backups (`maybe_backup_reviews()`, run at the start of `run_sync()`) are gzipped
   copies of the raw stored bytes in `wp-content/uploads/gbrr-location-sync/` (random file
   names, `.htaccess` + `index.php`), listed in `gbrr_location_sync_backups`. The newest 7

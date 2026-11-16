@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.7.0
+ * Version:     1.7.1
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.7.0' );
+define( 'GBRR_SYNC_VERSION',     '1.7.1' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
@@ -32,7 +32,12 @@ define( 'GBRR_SYNC_REVIEWS_PER_PAGE',      100 );
 // Bootstrap
 // ---------------------------------------------------------------------------
 
-add_action( 'init', array( 'GBRR_Location_Sync', 'get_instance' ) );
+// Started while this file loads, not on `init`: the parent plugin saves the
+// review store from its constructor on every admin request (wp-admin,
+// admin-ajax.php, admin-post.php), which runs as its file is included. The
+// save guard has to be hooked before that, so this plugin also keeps itself
+// first in the load order (see load_first()).
+GBRR_Location_Sync::get_instance();
 register_activation_hook( __FILE__,   array( 'GBRR_Location_Sync', 'activate' ) );
 register_deactivation_hook( __FILE__, array( 'GBRR_Location_Sync', 'deactivate' ) );
 
@@ -70,6 +75,11 @@ class GBRR_Location_Sync {
 		add_action( 'admin_post_gbrr_restore_backup', array( $this, 'handle_restore_backup' ) );
 		// Checks every save of the review store, the parent plugin's included.
 		add_filter( 'pre_update_option_' . GBRR_SYNC_OPTION_BASE . '_reviews', array( $this, 'guard_reviews_save' ), 10, 2 );
+		// Hands out the stored reviews when WordPress reports the store as missing.
+		add_filter( 'default_option_' . GBRR_SYNC_OPTION_BASE . '_reviews', array( $this, 'serve_stored_reviews' ), 10, 3 );
+		// Keeps this plugin loading before the parent, so the guard is in place first.
+		add_filter( 'pre_update_option_active_plugins', array( $this, 'load_first' ) );
+		$this->ensure_loads_first();
 	}
 
 	/** True while restore_backup() saves, which only ever adds reviews. */
@@ -442,7 +452,9 @@ class GBRR_Location_Sync {
 
 		if ( isset( $store['error'] ) ) {
 			$known = (int) get_option( GBRR_SYNC_KNOWN_COUNT_OPTION, 0 );
-			if ( count( $new ) + 5 >= $known ) {
+			// $known is 0 when that read failed too (the database is having
+			// trouble), which says nothing about how many are stored.
+			if ( $known > 0 && count( $new ) + 5 >= $known ) {
 				return $value; // e.g. the parent putting back its own copy after a failed import.
 			}
 			return $this->block_reviews_save( sprintf(
@@ -503,18 +515,99 @@ class GBRR_Location_Sync {
 		$to = $this->get_notify_recipients();
 		if ( ! empty( $to ) && ! get_transient( 'gbrr_guard_mailed' ) ) {
 			set_transient( 'gbrr_guard_mailed', 1, 6 * HOUR_IN_SECONDS );
-			wp_mail(
-				$to,
-				sprintf( '[%s] GBRR Location Sync: blocked a save that would have lost reviews', get_bloginfo( 'name' ) ),
-				sprintf(
-					"GBRR Location Sync stopped a save of the Reviews and Rating review store on %s:\n\n%s\n\nNothing was lost. If a plugin keeps trying, it's blocked again each time; further emails are held for 6 hours. See Settings \xE2\x86\x92 GBRR Sync on %s for the log and the review backups.",
-					gmdate( 'Y-m-d H:i:s' ) . ' UTC',
-					$message,
-					home_url()
-				)
-			);
+			$when = gmdate( 'Y-m-d H:i:s' ) . ' UTC';
+			$send = function () use ( $to, $message, $when ) {
+				wp_mail(
+					$to,
+					sprintf( '[%s] GBRR Location Sync: blocked a save that would have lost reviews', get_bloginfo( 'name' ) ),
+					sprintf(
+						"GBRR Location Sync stopped a save of the Reviews and Rating review store on %s:\n\n%s\n\nNothing was lost. If a plugin keeps trying, it's blocked again each time; further emails are held for 6 hours. See Settings \xE2\x86\x92 GBRR Sync on %s for the log and the review backups.",
+						$when,
+						$message,
+						home_url()
+					)
+				);
+			};
+			// The guard can fire while plugins are still loading, before
+			// WordPress has defined wp_mail().
+			if ( function_exists( 'wp_mail' ) ) {
+				$send();
+			} else {
+				add_action( 'plugins_loaded', $send );
+			}
 		}
 		return $old_value;
+	}
+
+	/**
+	 * default_option filter on the parent's review store: runs when
+	 * get_option() can't find the store and is about to hand back the
+	 * caller's default. That happens when the store doesn't exist, but also
+	 * when one read of it failed (a persistent object cache then remembers
+	 * it as missing for every later request). The parent takes that default
+	 * as "no reviews yet" and saves the few it just fetched over the store.
+	 * If the rows are in the database, return them instead.
+	 *
+	 * Only for calls that passed a default (the parent always does);
+	 * update_option() calls this filter without one to tell a missing
+	 * option from a stored one, and must keep getting the plain default.
+	 */
+	public function serve_stored_reviews( $default, $option = '', $passed_default = false ) {
+		if ( ! $passed_default ) {
+			return $default;
+		}
+		$store = $this->read_stored_reviews();
+		if ( isset( $store['error'] ) || empty( $store['reviews'] ) ) {
+			return $default;
+		}
+
+		$name       = GBRR_SYNC_OPTION_BASE . '_reviews';
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+		if ( is_array( $notoptions ) && isset( $notoptions[ $name ] ) ) {
+			unset( $notoptions[ $name ] );
+			wp_cache_set( 'notoptions', $notoptions, 'options' );
+		}
+
+		if ( ! get_transient( 'gbrr_guard_served' ) ) {
+			set_transient( 'gbrr_guard_served', 1, HOUR_IN_SECONDS );
+			$this->log( 'guard', sprintf(
+				'WordPress reported the review store as missing although %s review(s) are stored (a failed read, or a stale object cache). The stored reviews were used instead.',
+				number_format( count( $store['reviews'] ) )
+			) );
+		}
+		return $store['reviews'];
+	}
+
+	// -----------------------------------------------------------------------
+	// Load order
+	// -----------------------------------------------------------------------
+
+	/**
+	 * pre_update_option_active_plugins filter: keeps this plugin first.
+	 * WordPress includes plugins in the order of this list and re-sorts it
+	 * alphabetically whenever a plugin is activated, which puts the parent
+	 * (g-business-reviews-rating) ahead of this one.
+	 */
+	public function load_first( $plugins ) {
+		if ( ! is_array( $plugins ) ) {
+			return $plugins;
+		}
+		$index = array_search( plugin_basename( __FILE__ ), $plugins, true );
+		if ( false === $index || 0 === $index ) {
+			return $plugins;
+		}
+		$me = $plugins[ $index ];
+		unset( $plugins[ $index ] );
+		array_unshift( $plugins, $me );
+		return array_values( $plugins );
+	}
+
+	/** Moves this plugin to the front of the load order if it isn't there. Takes effect on the next request. */
+	private function ensure_loads_first() {
+		$plugins = get_option( 'active_plugins', array() );
+		if ( is_array( $plugins ) && $this->load_first( $plugins ) !== $plugins ) {
+			update_option( 'active_plugins', $plugins ); // load_first() reorders it on the way in.
+		}
 	}
 
 	private function remember_review_count( $count ) {
