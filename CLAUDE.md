@@ -87,6 +87,12 @@ Project notes for Claude Code working in this repo.
   are kept plus the one with the most reviews, so a slow loss can't age every good copy
   out. `restore_backup()` only adds missing reviews (never removes or changes one), skips
   locations no longer saved, gives colliding IDs new ones, and backs up the store first.
+- `maybe_notify_review_loss()` runs at the start of `run_sync()`, right after the backup. Per
+  saved location it compares the stored count with that location's highest count in any
+  backup entry (`places` in `gbrr_location_sync_backups`) and reports a drop of more than 5
+  and more than 10%. It always logs; it emails when the total shortfall is new or has grown,
+  else once a week (`gbrr_location_sync_loss_alert` holds the last emailed total and time,
+  and is emptied when nothing is short). Locations no longer saved are ignored.
 - `maybe_repair_reviews()` re-runs whenever `GBRR_SYNC_VERSION` changes; it must stay
   idempotent. It backfills missing keys (skipping rows that already have a `checked` key)
   and, on parent 6.x, removes rows that duplicate a `<place_id>_<author id>` row under
@@ -102,7 +108,7 @@ Project notes for Claude Code working in this repo.
 - Plugin-owned options: `gbrr_location_sync_log`, `gbrr_sync_db_version`,
   `gbrr_location_sync_notify_enabled`, `gbrr_location_sync_notify_email`,
   `gbrr_location_sync_backups`, `gbrr_location_sync_reviews_known`,
-  `gbrr_location_sync_hide_parent_reviews`.
+  `gbrr_location_sync_hide_parent_reviews`, `gbrr_location_sync_loss_alert`.
   Admin page: **Settings → GBRR Sync** (`options-general.php?page=gbrr-location-sync`).
 - Never log or display the API key; route error text through `redact_key()`.
 

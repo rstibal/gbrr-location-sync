@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.7.1
+ * Version:     1.8.0
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.7.1' );
+define( 'GBRR_SYNC_VERSION',     '1.8.0' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
@@ -25,6 +25,7 @@ define( 'GBRR_SYNC_NOTIFY_EMAIL_OPTION',   'gbrr_location_sync_notify_email' );
 define( 'GBRR_SYNC_BACKUPS_OPTION',        'gbrr_location_sync_backups' );
 define( 'GBRR_SYNC_KNOWN_COUNT_OPTION',    'gbrr_location_sync_reviews_known' );
 define( 'GBRR_SYNC_BACKUPS_KEEP',          7 );
+define( 'GBRR_SYNC_LOSS_ALERT_OPTION',     'gbrr_location_sync_loss_alert' );
 define( 'GBRR_SYNC_HIDE_PARENT_OPTION',    'gbrr_location_sync_hide_parent_reviews' );
 define( 'GBRR_SYNC_REVIEWS_PER_PAGE',      100 );
 
@@ -115,6 +116,9 @@ class GBRR_Location_Sync {
 	public function run_sync() {
 		// Daily copy of the review store, taken before anything is written.
 		$this->maybe_backup_reviews();
+		// Then compare what is stored with the backups, before anything
+		// below can end the run early.
+		$this->maybe_notify_review_loss();
 
 		$api_key = get_option( GBRR_SYNC_OPTION_BASE . '_api_key' );
 		$places  = get_option( GBRR_SYNC_OPTION_BASE . '_places', array() );
@@ -857,6 +861,100 @@ class GBRR_Location_Sync {
 		);
 
 		wp_mail( $to, $subject, $body );
+	}
+
+	/**
+	 * Daily check, at the start of each sync run: are far fewer reviews
+	 * stored for a saved location than a backup holds for it? If so, logs
+	 * it and emails the notification address(es).
+	 *
+	 * A location counts when it is down by more than 5 reviews and more
+	 * than 10% from its highest backup count. Locations that are no longer
+	 * saved are ignored. The email goes out when the shortfall is new or
+	 * has grown, and otherwise once a week, so a shortfall that is left on
+	 * purpose doesn't mail every day. Returns the shortfall per place ID.
+	 */
+	public function maybe_notify_review_loss( $now = null ) {
+		$now   = ( null === $now ) ? time() : (int) $now;
+		$store = $this->read_stored_reviews();
+		if ( isset( $store['error'] ) ) {
+			return array(); // Reported by the backup step and by each location's sync.
+		}
+		$stored = $this->count_by_place( $store['reviews'] );
+
+		$best = array(); // place ID => the backup entry with the most reviews for it
+		foreach ( $this->get_backups() as $entry ) {
+			foreach ( is_array( $entry['places'] ?? null ) ? $entry['places'] : array() as $pid => $count ) {
+				if ( ! isset( $best[ $pid ] ) || (int) $count > (int) $best[ $pid ]['places'][ $pid ] ) {
+					$best[ $pid ] = $entry;
+				}
+			}
+		}
+
+		$places = $this->fresh_option( GBRR_SYNC_OPTION_BASE . '_places', array() );
+		$short  = array();
+		$lines  = array();
+		$total  = 0;
+		foreach ( is_array( $places ) ? $places : array() as $place ) {
+			$pid = is_array( $place ) ? ( $place['place_id'] ?? null ) : null;
+			if ( ! is_string( $pid ) || ! isset( $best[ $pid ] ) ) {
+				continue;
+			}
+			$had  = (int) $best[ $pid ]['places'][ $pid ];
+			$have = (int) ( $stored[ $pid ] ?? 0 );
+			$drop = $had - $have;
+			if ( $drop <= 5 || $drop * 10 <= $had ) {
+				continue;
+			}
+			$short[ $pid ] = $drop;
+			$total        += $drop;
+			$lines[]       = sprintf(
+				'- %s (%s): %s stored, %s in the backup from %s UTC',
+				$place['name'] ?? $place['vicinity'] ?? $pid,
+				$pid,
+				number_format( $have ),
+				number_format( $had ),
+				gmdate( 'Y-m-d H:i', (int) $best[ $pid ]['time'] )
+			);
+		}
+
+		$last = get_option( GBRR_SYNC_LOSS_ALERT_OPTION, array() );
+		$last = is_array( $last ) ? $last : array();
+		if ( empty( $short ) ) {
+			if ( ! empty( $last ) ) {
+				update_option( GBRR_SYNC_LOSS_ALERT_OPTION, array(), 'no' );
+			}
+			return $short;
+		}
+
+		$this->log( 'guard', sprintf(
+			'%s fewer review(s) are stored than the backups hold, across %d location(s). If they went missing, restore a backup under Review Backups.',
+			number_format( $total ),
+			count( $short )
+		) );
+
+		$grown = ( $total > (int) ( $last['total'] ?? 0 ) );
+		if ( ! $grown && $now - (int) ( $last['time'] ?? 0 ) < 7 * DAY_IN_SECONDS ) {
+			return $short;
+		}
+		$to = $this->get_notify_recipients();
+		if ( empty( $to ) ) {
+			return $short;
+		}
+		update_option( GBRR_SYNC_LOSS_ALERT_OPTION, array( 'total' => $total, 'time' => $now ), 'no' );
+
+		wp_mail(
+			$to,
+			sprintf( '[%s] GBRR Location Sync: %s fewer review(s) stored than in the backups', get_bloginfo( 'name' ), number_format( $total ) ),
+			sprintf(
+				"GBRR Location Sync checked the stored reviews on %s. %d location(s) have far fewer reviews stored than a backup holds:\n\n%s\n\nIf these reviews went missing, go to Settings \xE2\x86\x92 GBRR Sync on %s, find Review Backups and use \"Restore Missing Reviews\" on the backup named above. Restoring only adds back missing reviews.\n\nIf the reviews were removed on purpose, ignore this. It is sent again only if more go missing, and otherwise once a week while the difference remains.",
+				gmdate( 'Y-m-d H:i:s', $now ) . ' UTC',
+				count( $short ),
+				implode( "\n", $lines ),
+				home_url()
+			)
+		);
+		return $short;
 	}
 
 	/**
