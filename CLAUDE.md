@@ -72,7 +72,15 @@ Project notes for Claude Code working in this repo.
   `$passed_default` is false: `update_option()` calls the filter that way to tell a missing
   option from a stored one. Why the store read as missing on 2026-11-14 was not established
   (no server logs); a "reported the review store as missing" log entry is the evidence to
-  look for next time.
+  look for next time. Compared on 2026-11-16: stoneinjurylawyers.com ran the same unguarded
+  path with the same parent 6.1, API mode, PHP and MySQL settings and lost nothing. Both
+  sites are on WP Engine with a memcached `object-cache.php`, so a failed read of the store
+  is remembered in the shared `notoptions` key for later requests. What differed was size:
+  979 reviews / 0.8 MB there, 8,329 / 6.2 MB on injurylawyers.com (both losses there
+  followed imports that took the store past 4 MB), and injurylawyers.com has the parent's
+  `_additional_array_sanitization` flag set, which the parent only sets after one of its
+  own imports fails to read back. Imports logged as successful on both; the 6.2 MB store
+  read back cleanly 16 times in our 00:00 UTC sync six hours before it was replaced.
 - Daily backups (`maybe_backup_reviews()`, run at the start of `run_sync()`) are gzipped
   copies of the raw stored bytes in `wp-content/uploads/gbrr-location-sync/` (random file
   names, `.htaccess` + `index.php`), listed in `gbrr_location_sync_backups`. The newest 7
