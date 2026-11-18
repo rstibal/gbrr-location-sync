@@ -3,7 +3,7 @@
  * Plugin Name: GBRR Location Sync
  * Plugin URI:  https://robstibal.com
  * Description: Automatically syncs all saved locations in Reviews and Rating – Google Reviews (g-business-reviews-rating) daily via WP-Cron, and fixes the duplicate-default-location bug that occurs after any manual location cycle.
- * Version:     1.8.0
+ * Version:     1.9.0
  * Author:      Rob Stibal
  * Author URI:  https://robstibal.com
  * License:     GPLv2 or later
@@ -15,9 +15,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'GBRR_SYNC_VERSION',     '1.8.0' );
+define( 'GBRR_SYNC_VERSION',     '1.9.0' );
 define( 'GBRR_SYNC_OPTION_BASE', 'google_business_reviews_rating' );
 define( 'GBRR_SYNC_CRON_HOOK',   'gbrr_location_sync_run' );
+define( 'GBRR_SYNC_CHECK_HOOK',  'gbrr_location_sync_check' );
 define( 'GBRR_SYNC_LOG_OPTION',  'gbrr_location_sync_log' );
 define( 'GBRR_SYNC_DB_OPTION',   'gbrr_sync_db_version' );
 define( 'GBRR_SYNC_NOTIFY_ENABLED_OPTION', 'gbrr_location_sync_notify_enabled' );
@@ -64,6 +65,8 @@ class GBRR_Location_Sync {
 
 	private function __construct() {
 		add_action( GBRR_SYNC_CRON_HOOK,          array( $this, 'run_sync' ) );
+		add_action( GBRR_SYNC_CHECK_HOOK,         array( $this, 'check_reviews' ) );
+		add_action( 'init',                        array( $this, 'ensure_check_scheduled' ) );
 		add_action( 'admin_menu',                  array( $this, 'admin_menu' ) );
 		add_action( 'admin_notices',               array( $this, 'dependency_notice' ) );
 		add_action( 'admin_post_gbrr_sync_now',    array( $this, 'handle_manual_sync' ) );
@@ -103,6 +106,7 @@ class GBRR_Location_Sync {
 			wp_unschedule_event( $timestamp, GBRR_SYNC_CRON_HOOK );
 		}
 		wp_clear_scheduled_hook( GBRR_SYNC_CRON_HOOK );
+		wp_clear_scheduled_hook( GBRR_SYNC_CHECK_HOOK );
 	}
 
 	// -----------------------------------------------------------------------
@@ -364,15 +368,12 @@ class GBRR_Location_Sync {
 	 * or ['error' => string].
 	 */
 	private function read_stored_reviews() {
-		global $wpdb;
-		$raw = $wpdb->get_var( $wpdb->prepare(
-			"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
-			GBRR_SYNC_OPTION_BASE . '_reviews'
-		) );
+		$read = $this->read_option_row( GBRR_SYNC_OPTION_BASE . '_reviews' );
+		if ( isset( $read['error'] ) ) {
+			return array( 'error' => 'database error reading the stored reviews: ' . $read['error'] );
+		}
+		$raw = $read['raw'];
 		if ( null === $raw ) {
-			if ( '' !== (string) $wpdb->last_error ) {
-				return array( 'error' => 'database error reading the stored reviews: ' . $wpdb->last_error );
-			}
 			return array( 'reviews' => array(), 'raw' => null ); // No store yet.
 		}
 		$value = maybe_unserialize( $raw );
@@ -384,6 +385,40 @@ class GBRR_Location_Sync {
 			return array( 'reviews' => array(), 'raw' => $raw );
 		}
 		return array( 'error' => sprintf( 'the stored reviews (%s bytes) could not be read', number_format( strlen( $raw ) ) ) );
+	}
+
+	/**
+	 * Reads one option's raw value straight from the database. Returns
+	 * ['raw' => string] or ['raw' => null] when there is no such row, or
+	 * ['error' => string] when the query didn't run.
+	 *
+	 * Uses query() rather than get_var(): get_var() returns null both for
+	 * "no row" and for a query that failed without setting an error (a
+	 * `query` filter that stops it, a lost connection that couldn't be
+	 * reopened), and in some of those cases hands back an earlier query's
+	 * result. Reading a failed read as "no row" let the parent's save of 5
+	 * reviews replace 8,400 on 2026-11-18.
+	 */
+	private function read_option_row( $name ) {
+		global $wpdb;
+		$suppress = $wpdb->suppress_errors( true );
+		$rows     = $wpdb->query( $wpdb->prepare(
+			"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+			$name
+		) );
+		$wpdb->suppress_errors( $suppress );
+		$error = (string) $wpdb->last_error;
+		if ( false === $rows || '' !== $error ) {
+			return array( 'error' => '' !== $error ? $error : 'the database did not run the query' );
+		}
+		if ( 0 === (int) $rows ) {
+			return array( 'raw' => null );
+		}
+		$row = ( is_array( $wpdb->last_result ) && isset( $wpdb->last_result[0] ) ) ? $wpdb->last_result[0] : null;
+		if ( ! is_object( $row ) || ! isset( $row->option_value ) ) {
+			return array( 'error' => 'the database returned no value for a row it found' );
+		}
+		return array( 'raw' => (string) $row->option_value );
 	}
 
 	/**
@@ -471,6 +506,18 @@ class GBRR_Location_Sync {
 
 		$stored = $store['reviews'];
 		if ( empty( $stored ) ) {
+			// An empty store is only trusted when no larger one was known:
+			// on 2026-11-14 and 2026-11-18 the store read as empty in the
+			// request that replaced it, and this branch let the save through.
+			$known = (int) $this->fresh_option( GBRR_SYNC_KNOWN_COUNT_OPTION, 0 );
+			if ( $known > 5 && count( $new ) + 5 < $known ) {
+				return $this->block_reviews_save( sprintf(
+					'the review store reads as %s, but %s reviews were last known to be stored, and the new value has only %s',
+					null === $store['raw'] ? 'missing' : 'empty',
+					number_format( $known ),
+					number_format( count( $new ) )
+				), $old_value );
+			}
 			$this->remember_review_count( count( $new ) );
 			return $value;
 		}
@@ -478,7 +525,13 @@ class GBRR_Location_Sync {
 		$before = $this->count_by_place( $stored );
 		$after  = $this->count_by_place( $new );
 		$lost   = array();
-		foreach ( $this->saved_place_ids() as $pid ) {
+		$saved  = $this->saved_place_ids();
+		if ( empty( $saved ) ) {
+			// The location list read as empty (or failed to read) while
+			// reviews are stored: count every stored location as saved.
+			$saved = array_keys( $before );
+		}
+		foreach ( $saved as $pid ) {
 			$drop = ( $before[ $pid ] ?? 0 ) - ( $after[ $pid ] ?? 0 );
 			if ( $drop > 0 ) {
 				$lost[ $pid ] = $drop;
@@ -489,7 +542,8 @@ class GBRR_Location_Sync {
 		$allowed = ( $total <= 5 );
 		if ( ! $allowed && 1 === count( $lost ) ) {
 			$pid     = key( $lost );
-			$allowed = ( $pid !== $this->fresh_option( GBRR_SYNC_OPTION_BASE . '_place_id' ) && 0 === ( $after[ $pid ] ?? 0 ) );
+			$active  = $this->fresh_option( GBRR_SYNC_OPTION_BASE . '_place_id' );
+			$allowed = ( is_string( $active ) && '' !== $active && $pid !== $active && 0 === ( $after[ $pid ] ?? 0 ) );
 		}
 		if ( $allowed ) {
 			$this->remember_review_count( count( $new ) );
@@ -672,7 +726,12 @@ class GBRR_Location_Sync {
 		if ( empty( $store['reviews'] ) || null === $store['raw'] ) {
 			return null;
 		}
-		$this->remember_review_count( count( $store['reviews'] ) );
+		// Only fills in a missing count. Lowering it here would let a
+		// replaced store through the guard; counts go down only through
+		// saves the guard allowed.
+		if ( (int) $this->fresh_option( GBRR_SYNC_KNOWN_COUNT_OPTION, 0 ) < 1 ) {
+			$this->remember_review_count( count( $store['reviews'] ) );
+		}
 
 		$dir  = $this->backup_dir();
 		$gz   = function_exists( 'gzencode' ) ? gzencode( $store['raw'], 6 ) : false;
@@ -805,10 +864,15 @@ class GBRR_Location_Sync {
 	 * made by other requests since this one started are seen.
 	 */
 	private function fresh_option( $name, $default = false ) {
-		wp_cache_delete( $name, 'options' );
-		wp_cache_delete( 'alloptions', 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
-		return get_option( $name, $default );
+		// Read from the database rather than clearing the option caches:
+		// with a persistent object cache (memcached on WP Engine) clearing
+		// `alloptions` / `notoptions` clears them for every request on the
+		// site, and the guard ran this on every save of the review store.
+		$read = $this->read_option_row( $name );
+		if ( isset( $read['error'] ) ) {
+			return get_option( $name, $default );
+		}
+		return ( null === $read['raw'] ) ? $default : maybe_unserialize( $read['raw'] );
 	}
 
 	// -----------------------------------------------------------------------
@@ -864,9 +928,11 @@ class GBRR_Location_Sync {
 	}
 
 	/**
-	 * Daily check, at the start of each sync run: are far fewer reviews
-	 * stored for a saved location than a backup holds for it? If so, logs
-	 * it and emails the notification address(es).
+	 * Hourly check (check_reviews()) and at the start of each sync run: are
+	 * far fewer reviews stored for a saved location than a backup holds for
+	 * it? If so, and $restore, first puts the missing reviews back from the
+	 * backups and emails what it did. Whatever is still short is logged and
+	 * emailed as below.
 	 *
 	 * A location counts when it is down by more than 5 reviews and more
 	 * than 10% from its highest backup count. Locations that are no longer
@@ -874,11 +940,148 @@ class GBRR_Location_Sync {
 	 * has grown, and otherwise once a week, so a shortfall that is left on
 	 * purpose doesn't mail every day. Returns the shortfall per place ID.
 	 */
-	public function maybe_notify_review_loss( $now = null ) {
+	public function maybe_notify_review_loss( $now = null, $restore = true ) {
 		$now   = ( null === $now ) ? time() : (int) $now;
+		$found = $this->find_review_shortfall();
+		if ( null === $found ) {
+			return array(); // Store unreadable: reported by the backup step and by each location's sync.
+		}
+
+		if ( $restore && ! empty( $found['short'] ) ) {
+			$restored = $this->auto_restore( $found );
+			if ( ! empty( $restored ) ) {
+				$after = $this->find_review_shortfall();
+				$this->notify_auto_restore( $found, $restored, $after, $now );
+				if ( null === $after ) {
+					return $found['short'];
+				}
+				$found = $after;
+			}
+		}
+
+		$short = $found['short'];
+		$lines = $found['lines'];
+		$total = $found['total'];
+
+		$last = get_option( GBRR_SYNC_LOSS_ALERT_OPTION, array() );
+		$last = is_array( $last ) ? $last : array();
+		if ( empty( $short ) ) {
+			if ( ! empty( $last ) ) {
+				update_option( GBRR_SYNC_LOSS_ALERT_OPTION, array(), 'no' );
+			}
+			return $short;
+		}
+
+		$this->log( 'guard', sprintf(
+			'%s fewer review(s) are stored than the backups hold, across %d location(s). If they went missing, restore a backup under Review Backups.',
+			number_format( $total ),
+			count( $short )
+		) );
+
+		$grown = ( $total > (int) ( $last['total'] ?? 0 ) );
+		if ( ! $grown && $now - (int) ( $last['time'] ?? 0 ) < 7 * DAY_IN_SECONDS ) {
+			return $short;
+		}
+		$to = $this->get_notify_recipients();
+		if ( empty( $to ) ) {
+			return $short;
+		}
+		update_option( GBRR_SYNC_LOSS_ALERT_OPTION, array( 'total' => $total, 'time' => $now ), 'no' );
+
+		wp_mail(
+			$to,
+			sprintf( '[%s] GBRR Location Sync: %s fewer review(s) stored than in the backups', get_bloginfo( 'name' ), number_format( $total ) ),
+			sprintf(
+				"GBRR Location Sync checked the stored reviews on %s. %d location(s) have far fewer reviews stored than a backup holds:\n\n%s\n\nIf these reviews went missing, go to Settings \xE2\x86\x92 GBRR Sync on %s, find Review Backups and use \"Restore Missing Reviews\" on the backup named above. Restoring only adds back missing reviews.\n\nIf the reviews were removed on purpose, ignore this. It is sent again only if more go missing, and otherwise once a week while the difference remains.",
+				gmdate( 'Y-m-d H:i:s', $now ) . ' UTC',
+				count( $short ),
+				implode( "\n", $lines ),
+				home_url()
+			)
+		);
+		return $short;
+	}
+
+	/**
+	 * Hourly WP-Cron check (GBRR_SYNC_CHECK_HOOK): the same loss check and
+	 * automatic restore the daily sync starts with. The parent can replace
+	 * the store on any admin request, so a daily check left it empty for
+	 * up to a day (2026-11-18: replaced at 06:11 UTC, next check at 00:00).
+	 */
+	public function check_reviews() {
+		return $this->maybe_notify_review_loss();
+	}
+
+	/** Schedules the hourly check on sites that updated without reactivating. */
+	public function ensure_check_scheduled() {
+		if ( ! wp_next_scheduled( GBRR_SYNC_CHECK_HOOK ) ) {
+			wp_schedule_event( time() + 5 * MINUTE_IN_SECONDS, 'hourly', GBRR_SYNC_CHECK_HOOK );
+		}
+	}
+
+	/**
+	 * Puts back missing reviews of the short locations from the backup
+	 * that holds the most for each (restore_backup() only adds missing
+	 * reviews of saved locations). Returns the restore messages of the
+	 * backups that added any.
+	 */
+	private function auto_restore( $found ) {
+		$files = array();
+		foreach ( array_keys( $found['short'] ) as $pid ) {
+			$entry = $found['best'][ $pid ];
+			$files[ $entry['file'] ] = (int) $entry['time'];
+		}
+		arsort( $files ); // Newest first: older backups then only fill gaps.
+
+		$messages = array();
+		foreach ( array_keys( $files ) as $file ) {
+			$result = $this->restore_backup( $file );
+			if ( ! empty( $result['ok'] ) && ! empty( $result['added'] ) ) {
+				$messages[] = $result['message'];
+			} elseif ( empty( $result['ok'] ) ) {
+				$this->log( 'error', 'Automatic restore failed: ' . $result['message'] );
+			}
+		}
+		return $messages;
+	}
+
+	/** Emails what the automatic restore found and put back. */
+	private function notify_auto_restore( $found, $restored, $after, $now ) {
+		$to = $this->get_notify_recipients();
+		if ( empty( $to ) ) {
+			return;
+		}
+		if ( null === $after ) {
+			$left = "The stored reviews could not be read after the restore; check Settings \xE2\x86\x92 GBRR Sync.";
+		} elseif ( empty( $after['short'] ) ) {
+			$left = 'Every location now has about as many reviews as its backups hold.';
+		} else {
+			$left = sprintf( "Still short after the restore:\n\n%s", implode( "\n", $after['lines'] ) );
+		}
+		wp_mail(
+			$to,
+			sprintf( '[%s] GBRR Location Sync: %s missing review(s) found and restored', get_bloginfo( 'name' ), number_format( $found['total'] ) ),
+			sprintf(
+				"GBRR Location Sync checked the stored reviews on %s and found far fewer than the backups hold:\n\n%s\n\nIt put the missing reviews back from the backups:\n\n%s\n\n%s\n\nSomething replaced the review store since the last check. See Settings \xE2\x86\x92 GBRR Sync on %s for the log. Reviews removed on purpose from a location that is still saved are put back too; to remove a location's reviews, delete the location in Reviews and Rating.",
+				gmdate( 'Y-m-d H:i:s', $now ) . ' UTC',
+				implode( "\n", $found['lines'] ),
+				'- ' . implode( "\n- ", $restored ),
+				$left,
+				home_url()
+			)
+		);
+	}
+
+	/**
+	 * Saved locations with far fewer reviews stored than their best backup.
+	 * Returns null when the store can't be read, else ['short' => place ID
+	 * => drop, 'lines' => email lines, 'total' => int, 'best' => place ID
+	 * => backup entry].
+	 */
+	private function find_review_shortfall() {
 		$store = $this->read_stored_reviews();
 		if ( isset( $store['error'] ) ) {
-			return array(); // Reported by the backup step and by each location's sync.
+			return null;
 		}
 		$stored = $this->count_by_place( $store['reviews'] );
 
@@ -918,43 +1121,7 @@ class GBRR_Location_Sync {
 			);
 		}
 
-		$last = get_option( GBRR_SYNC_LOSS_ALERT_OPTION, array() );
-		$last = is_array( $last ) ? $last : array();
-		if ( empty( $short ) ) {
-			if ( ! empty( $last ) ) {
-				update_option( GBRR_SYNC_LOSS_ALERT_OPTION, array(), 'no' );
-			}
-			return $short;
-		}
-
-		$this->log( 'guard', sprintf(
-			'%s fewer review(s) are stored than the backups hold, across %d location(s). If they went missing, restore a backup under Review Backups.',
-			number_format( $total ),
-			count( $short )
-		) );
-
-		$grown = ( $total > (int) ( $last['total'] ?? 0 ) );
-		if ( ! $grown && $now - (int) ( $last['time'] ?? 0 ) < 7 * DAY_IN_SECONDS ) {
-			return $short;
-		}
-		$to = $this->get_notify_recipients();
-		if ( empty( $to ) ) {
-			return $short;
-		}
-		update_option( GBRR_SYNC_LOSS_ALERT_OPTION, array( 'total' => $total, 'time' => $now ), 'no' );
-
-		wp_mail(
-			$to,
-			sprintf( '[%s] GBRR Location Sync: %s fewer review(s) stored than in the backups', get_bloginfo( 'name' ), number_format( $total ) ),
-			sprintf(
-				"GBRR Location Sync checked the stored reviews on %s. %d location(s) have far fewer reviews stored than a backup holds:\n\n%s\n\nIf these reviews went missing, go to Settings \xE2\x86\x92 GBRR Sync on %s, find Review Backups and use \"Restore Missing Reviews\" on the backup named above. Restoring only adds back missing reviews.\n\nIf the reviews were removed on purpose, ignore this. It is sent again only if more go missing, and otherwise once a week while the difference remains.",
-				gmdate( 'Y-m-d H:i:s', $now ) . ' UTC',
-				count( $short ),
-				implode( "\n", $lines ),
-				home_url()
-			)
-		);
-		return $short;
+		return array( 'short' => $short, 'lines' => $lines, 'total' => $total, 'best' => $best );
 	}
 
 	/**
@@ -1837,7 +2004,7 @@ class GBRR_Location_Sync {
 			$stored_count = count( $reviews );
 			?>
 			<h2 id="gbrr-backups">Review Backups</h2>
-			<p class="description" style="max-width:780px;">A copy of the stored reviews is saved once a day, before the daily sync, in <code>wp-content/uploads/gbrr-location-sync/</code>. The <?php echo esc_html( GBRR_SYNC_BACKUPS_KEEP ); ?> newest are kept, plus the one with the most reviews. Restoring adds back the reviews a backup has that are missing now; it never removes or changes a stored review, and skips locations that are no longer saved.</p>
+			<p class="description" style="max-width:780px;">A copy of the stored reviews is saved once a day, before the daily sync, in <code>wp-content/uploads/gbrr-location-sync/</code>. The <?php echo esc_html( GBRR_SYNC_BACKUPS_KEEP ); ?> newest are kept, plus the one with the most reviews. Restoring adds back the reviews a backup has that are missing now; it never removes or changes a stored review, and skips locations that are no longer saved. Every hour the stored reviews are compared with the backups; a saved location that is down by more than 5 and more than 10% is restored automatically, and the notification address(es) are emailed.</p>
 			<?php if ( $largest_backup && $stored_count + 5 < (int) $largest_backup['count'] ) : ?>
 				<div class="notice notice-warning inline"><p><strong>Fewer reviews are stored than in a backup.</strong> <?php echo esc_html( sprintf( 'The store has %s reviews; the backup from %s UTC has %s. If reviews went missing, restore that backup below.', number_format( $stored_count ), gmdate( 'Y-m-d H:i', (int) $largest_backup['time'] ), number_format( (int) $largest_backup['count'] ) ) ); ?></p></div>
 			<?php endif; ?>

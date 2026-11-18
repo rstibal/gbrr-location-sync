@@ -36,15 +36,21 @@ Project notes for Claude Code working in this repo.
   doesn't match the parent's makes a duplicate row. `parent_keys_by_author()` detects 6.x.
 - The parent's hourly sync can write the same options while our requests are in flight.
   `run_sync()` therefore saves each location as soon as it's fetched via `persist_place()`,
-  which re-reads the options with `fresh_option()` (bypassing the request's option cache)
-  and merges in only that location's changes. Don't go back to read-once / write-at-end.
+  which re-reads the options with `fresh_option()` (a direct database read via
+  `read_option_row()`) and merges in only that location's changes. Don't go back to
+  read-once / write-at-end. `fresh_option()` must not clear `alloptions` / `notoptions`:
+  with memcached that clears them for every request on the site (it did until 1.9.0, on
+  every guarded save).
 - Every write of the whole review store goes through `read_stored_reviews()`, which reads
   the row straight from the database. `get_option()` returns its default both when the
   store doesn't exist and when it can't be read (failed query, data that won't
   unserialize); treating an unreadable store as empty and saving erased about 3,800
   imported reviews on injurylawyers.com in Nov 2026 (the store was ~4–5 MB). Refuse to
   write on a read error, re-read after writing, and put the previous bytes back if the
-  new value doesn't read back.
+  new value doesn't read back. `read_option_row()` uses `$wpdb->query()` and its return
+  value, never `get_var()`: `get_var()` returns null both for "no row" and for a query that
+  failed without setting `last_error` (a `query` filter like WP Engine's governor, a lost
+  connection that couldn't be reopened). Until 1.9.0 that null read as "no store yet".
 - `guard_reviews_save()` is a `pre_update_option_google_business_reviews_rating_reviews`
   filter, so it checks every plugin's save of the store, the parent's included; returning
   `$old_value` makes WordPress skip the save. It blocks a save that removes more than 5
@@ -52,8 +58,20 @@ Project notes for Claude Code working in this repo.
   parent's `delete_place()` saves the reviews *before* removing the location), and a
   save over an unreadable store unless it keeps about the last known count
   (`gbrr_location_sync_reviews_known`; lets the parent's failed-import rollback through).
-  Our own saves that remove rows on purpose (the repair's dedupe, `restore_backup()`)
-  set `$this->guard_off`.
+  Since 1.9.0 it also blocks a save over a store that reads as missing or empty when the
+  new value is more than 5 below the known count (deleting that option lifts this after a
+  deliberate reset of the parent), counts every stored location as saved when the saved
+  list reads as empty, and only allows the one-location exception when the active place ID
+  reads as a non-empty string. Only allowed saves and restores change the known count;
+  `maybe_backup_reviews()` only fills it in when it is missing. Our own saves that remove
+  rows on purpose (the repair's dedupe, `restore_backup()`) set `$this->guard_off`.
+- 2026-11-18, injurylawyers.com: the store was replaced at 06:11:59 UTC by a parent
+  admin-side request (no Google request was logged then, so it rebuilt from the cached
+  result) with the active location's 5 reviews, again with no guard log entry and no email,
+  under 1.8.0 with this plugin loading first. The same happened on 2026-11-17 before
+  14:31 UTC. The five rows' `retrieved` time dates it. In the stub harness, 1.8.0 reproduces
+  it exactly when the guard's store read, or its read of `_places`, fails without an error;
+  which one failed on the site isn't known (no server logs).
 - The guard only sees saves made after it is hooked. The parent's `dashboard/index.php` ends
   with `new google_business_reviews_rating_dashboard()`, whose constructor runs `setup()` →
   `set_data()` → `set_reviews()` and saves the store **while the parent's file is included**,
@@ -87,10 +105,15 @@ Project notes for Claude Code working in this repo.
   are kept plus the one with the most reviews, so a slow loss can't age every good copy
   out. `restore_backup()` only adds missing reviews (never removes or changes one), skips
   locations no longer saved, gives colliding IDs new ones, and backs up the store first.
-- `maybe_notify_review_loss()` runs at the start of `run_sync()`, right after the backup. Per
+- `maybe_notify_review_loss()` runs hourly (`gbrr_location_sync_check` →
+  `check_reviews()`, scheduled on `init` by `ensure_check_scheduled()` so updated sites get it
+  without reactivating) and at the start of `run_sync()`, right after the backup. Per
   saved location it compares the stored count with that location's highest count in any
-  backup entry (`places` in `gbrr_location_sync_backups`) and reports a drop of more than 5
-  and more than 10%. It always logs; it emails when the total shortfall is new or has grown,
+  backup entry (`places` in `gbrr_location_sync_backups`) and finds a drop of more than 5
+  and more than 10%. It first restores those locations from their best backups
+  (`auto_restore()`, newest backup first) and emails what it put back; this also brings back
+  reviews removed on purpose from a location that is still saved. Whatever is still short
+  is logged; it emails when the total shortfall is new or has grown,
   else once a week (`gbrr_location_sync_loss_alert` holds the last emailed total and time,
   and is emptied when nothing is short). Locations no longer saved are ignored.
 - `maybe_repair_reviews()` re-runs whenever `GBRR_SYNC_VERSION` changes; it must stay
